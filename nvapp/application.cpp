@@ -17,6 +17,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <algorithm>
 #include <array>
 #include <filesystem>
 #include <volk/volk.h>
@@ -941,8 +942,20 @@ void nvapp::Application::headlessRun()
 
   // Rendering n-times the scene. A zero count keeps a headless application
   // alive for an external controller until close() is requested.
+  // An open-ended run (frame count 0) serves a live host, so time advances with the wall clock.
+  // A fixed frame count keeps ImGui's default fixed step, so captures stay reproducible.
+  auto lastFrameTime = std::chrono::steady_clock::now();
   for(uint32_t frameID = 0; (m_headlessFrameCount == 0 || frameID < m_headlessFrameCount) && !m_headlessClose; frameID++)
   {
+    applyHeadlessResize();
+    if(m_headlessFrameCount == 0)
+    {
+      const auto now = std::chrono::steady_clock::now();
+      const float dt = std::chrono::duration<float>(now - lastFrameTime).count();
+      lastFrameTime  = now;
+      if(frameID > 0)
+        ImGui::GetIO().DeltaTime = std::clamp(dt, 1e-4F, 0.25F);
+    }
     for(std::shared_ptr<IAppElement>& e : m_elements)
     {
       e->onUpdate();
@@ -976,6 +989,43 @@ void nvapp::Application::headlessRun()
   {
     e->onLastHeadlessFrame();
   }
+}
+
+void nvapp::Application::requestHeadlessResize(VkExtent2D size)
+{
+  if(!m_headless || size.width == 0 || size.height == 0)
+    return;
+  std::lock_guard lock(m_headlessResizeMutex);
+  m_headlessResizeRequest = size;
+}
+
+// Headless loop, between frames: apply a pending requestHeadlessResize() the same way the
+// start of headlessRun() sizes everything, with the device idle.
+void nvapp::Application::applyHeadlessResize()
+{
+  VkExtent2D size{};
+  {
+    std::lock_guard lock(m_headlessResizeMutex);
+    size                    = m_headlessResizeRequest;
+    m_headlessResizeRequest = {0, 0};
+  }
+  if(size.width == 0 || size.height == 0 || (size.width == m_viewportSize.width && size.height == m_viewportSize.height))
+    return;
+
+  vkDeviceWaitIdle(m_device);
+  m_windowSize   = size;
+  m_viewportSize = size;
+  ImGuiIO& io      = ImGui::GetIO();
+  io.DisplaySize.x = float(size.width);
+  io.DisplaySize.y = float(size.height);
+
+  VkCommandBuffer cmd{};
+  NVVK_CHECK(nvvk::beginSingleTimeCommands(cmd, m_device, m_transientCmdPool));
+  for(std::shared_ptr<IAppElement>& e : m_elements)
+  {
+    e->onResize(cmd, m_viewportSize);
+  }
+  NVVK_CHECK(nvvk::endSingleTimeCommands(cmd, m_device, m_transientCmdPool, m_queues[0].queue));
 }
 
 //-----------------------------------------------------------------------

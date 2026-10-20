@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -207,6 +208,9 @@ public:
   bool     isVsync() const { return m_vsyncWanted; }                        // Return true if V-Sync is on
   void     setVsync(bool v);                                                // Set V-Sync on or off
   bool     isHeadless() const { return m_headless; }                        // Return true if headless
+  // Headless only: resize the offscreen viewport before the next frame (every element gets
+  // onResize). Safe to call from any thread; ignored in a windowed run.
+  void requestHeadlessResize(VkExtent2D size);
   bool     getPersistSettings() const { return m_persistSettings; }  // Return true if <exe>.ini is restored/saved
   void     setRenderWhileMinimized(bool v) { m_renderWhileMinimized = v; }  // Continue rendering when minimized
   uint32_t getHeadlessFrameCount() const { return m_headlessFrameCount; }   // Number of frames to render in headless
@@ -308,6 +312,7 @@ protected:
   VkResult                                  createDescriptorPool();
   void                                      onViewportSizeChange(VkExtent2D size);
   void                                      headlessRun();
+  void                                      applyHeadlessResize();
   VkCommandBuffer                           beginCommandRecording();
   void                                      addSwapchainSemaphores();
   void                                      drawFrame(VkCommandBuffer cmd);
@@ -382,6 +387,8 @@ protected:
   bool     m_headless{false};
   bool     m_persistSettings{true};  // ApplicationCreateInfo::persistSettings, forced off in headless
   bool     m_headlessClose{false};
+  std::mutex m_headlessResizeMutex;
+  VkExtent2D m_headlessResizeRequest{0, 0};  // {0,0}: none pending
   uint32_t m_headlessFrameCount{1};
   bool     m_renderWhileMinimized{false};  // Continue rendering when window minimized (for external presenters)
   bool     m_screenShotRequested = false;
