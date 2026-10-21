@@ -126,7 +126,11 @@ result.
 -------------------------------------------------------------------------------------------------*/
 float3 volumeExtinctionCoefficient(PbrMaterial mat)
 {
-  return -log(max(mat.attenuationColor, float3(0.001))) / max(mat.attenuationDistance, 0.001);
+  // The distance floor only guards the division. It was 1 mm, which silently capped every medium
+  // denser than that at 1000/m: skin measured at a 0.15 mm mean free path (Iray's defaults) got a
+  // seven times longer walk, and since the scattering coefficient is derived from the unclamped
+  // distance, min(sigma_s, sigma_t) then left it with no absorption at all, a white medium.
+  return -log(max(mat.attenuationColor, float3(0.001))) / max(mat.attenuationDistance, 1e-7);
 }
 
 /*-------------------------------------------------------------------------------------------------
