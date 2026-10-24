@@ -60,8 +60,8 @@ struct PbrMaterial
   float  attenuationDistance;  //
   float  thickness;            // KHR_materials_volume thicknessFactor * thicknessTexture (object-space)
 
-  float3 scatterCoefficient;   // KHR_materials_scatter: σ_s (scattering coefficient)
-  float  scatterAnisotropy;    // KHR_materials_scatter: g parameter for Henyey-Greenstein
+  float3 scatterCoefficient;  // KHR_materials_scatter: σ_s (scattering coefficient)
+  float  scatterAnisotropy;   // KHR_materials_scatter: g parameter for Henyey-Greenstein
 
   float  clearcoat;           // KHR_materials_clearcoat
   float  clearcoatRoughness;  //
@@ -75,7 +75,7 @@ struct PbrMaterial
   float  sheenRoughness;
 
   float  diffuseTransmissionFactor;  // KHR_materials_diffuse_transmission
-  float3 diffuseTransmissionColor;
+  float3 diffuseTransmissionColorFactor;
 
   float retroreflection;  // KHR_materials_retroreflection [0,1] MRM blend
 };
@@ -126,8 +126,8 @@ PbrMaterial defaultPbrMaterial()
   mat.sheenRoughness = 0.0F;
   mat.occlusion      = 1.0F;
 
-  mat.diffuseTransmissionFactor = 0.0F;
-  mat.diffuseTransmissionColor  = float3(1.0F);
+  mat.diffuseTransmissionFactor      = 0.0F;
+  mat.diffuseTransmissionColorFactor = float3(1.0F);
 
   mat.retroreflection = 0.0F;
 
@@ -149,5 +149,19 @@ PbrMaterial defaultPbrMaterial(float3 baseColor, float metallic, float roughness
   orthonormalBasis(mat.N, mat.T, mat.B);
 
   return mat;
+}
+
+/*
+Volumetric extinction coefficient `sigma_t = -log(c) / d` of a KHR_materials_volume medium, from
+its attenuation color `c` and distance `d` (scene units). The one definition of sigma_t: every
+consumer -- Beer's law, free-flight sampling, the scatter split -- must call it, so they all see
+the same medium. The PbrMaterial overload in bsdf_functions.h.slang documents its use.
+
+`c` is floored so a black channel stays finite (log(0) is -inf). `d` is only kept off zero: any
+positive distance is valid and must be honored, however dense the medium it describes.
+*/
+float3 volumeExtinctionCoefficient(float3 attenuationColor, float attenuationDistance)
+{
+  return -log(max(attenuationColor, float3(0.001))) / max(attenuationDistance, 1e-6);
 }
 #endif  // NVVKHL_PBR_MAT_STRUCT_H

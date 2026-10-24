@@ -126,11 +126,10 @@ result.
 -------------------------------------------------------------------------------------------------*/
 float3 volumeExtinctionCoefficient(PbrMaterial mat)
 {
-  // The distance floor only guards the division. It was 1 mm, which silently capped every medium
-  // denser than that at 1000/m: skin measured at a 0.15 mm mean free path (Iray's defaults) got a
-  // seven times longer walk, and since the scattering coefficient is derived from the unclamped
-  // distance, min(sigma_s, sigma_t) then left it with no absorption at all, a white medium.
-  return -log(max(mat.attenuationColor, float3(0.001))) / max(mat.attenuationDistance, 1e-7);
+  // one definition (pbr_material_types.h.slang); its distance floor is a micrometre, so a medium
+  // measured in tenths of a millimetre (skin) keeps its density
+  return volumeExtinctionCoefficient(mat.attenuationColor, mat.attenuationDistance);
+
 }
 
 /*-------------------------------------------------------------------------------------------------
@@ -441,7 +440,7 @@ void brdf_diffuse_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial 
 
 // Evaluates the diffuse-transmission lobe (Lambertian BTDF).
 // Per KHR_materials_diffuse_transmission, the BTDF color is `tint` (the caller passes
-// `mat.diffuseTransmissionColor`). Independent of the surface's `baseColor` -- baseColor
+// `mat.diffuseTransmissionColorFactor`). Independent of the surface's `baseColor` -- baseColor
 // only affects the diffuse REFLECTION lobe. Symmetric with `brdf_diffuse_eval`.
 void brdf_diffuse_transmission_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat, float3 tint)
 {
@@ -461,7 +460,7 @@ void brdf_diffuse_transmission_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data,
 
 // Samples the diffuse-transmission lobe.
 // Per KHR_materials_diffuse_transmission, the BTDF color is `tint` (the caller passes
-// `mat.diffuseTransmissionColor`). Independent of the surface's `baseColor`. Symmetric with
+// `mat.diffuseTransmissionColorFactor`). Independent of the surface's `baseColor`. Symmetric with
 // `brdf_diffuse_sample`.
 void brdf_diffuse_transmission_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat, float3 tint)
 {
@@ -473,7 +472,7 @@ void brdf_diffuse_transmission_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data,
   // Compute the PDF for this direction.
   data.pdf = dot(data.k2, -mat.N) * M_1_PI;
 
-  // Lambertian BTDF / cosine-PDF; cancels to just `tint` (= diffuseTransmissionColor).
+  // Lambertian BTDF / cosine-PDF; cancels to just `tint` (= diffuseTransmissionColorFactor).
   data.bsdf_over_pdf = tint;
   data.event_type    = BSDF_EVENT_DIFFUSE_TRANSMISSION;
 }
@@ -1053,10 +1052,10 @@ int bsdfEvaluateCore(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial ma
   }
   else if(lobe == LOBE_DIFFUSE_TRANSMISSION)
   {
-    // Per KHR_materials_diffuse_transmission, the BTDF color is `diffuseTransmissionColor`,
+    // Per KHR_materials_diffuse_transmission, the BTDF color is `diffuseTransmissionColorFactor`,
     // independent of `baseColor`. Pass it directly (bypassing the iridescence-modified `tint`,
     // which only applies to the dielectric base / specular layers).
-    brdf_diffuse_transmission_eval(data, mat, mat.diffuseTransmissionColor);
+    brdf_diffuse_transmission_eval(data, mat, mat.diffuseTransmissionColorFactor);
   }
   else if(lobe == LOBE_SPECULAR_REFLECTION)
   {
@@ -1153,9 +1152,9 @@ void bsdfSampleLobe(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat, 
   }
   else if(lobe == LOBE_DIFFUSE_TRANSMISSION)
   {
-    // Per KHR_materials_diffuse_transmission, the BTDF color is `diffuseTransmissionColor`,
+    // Per KHR_materials_diffuse_transmission, the BTDF color is `diffuseTransmissionColorFactor`,
     // independent of `baseColor`. Pass it directly; see brdf_diffuse_transmission_eval dispatch.
-    brdf_diffuse_transmission_sample(data, mat, mat.diffuseTransmissionColor);
+    brdf_diffuse_transmission_sample(data, mat, mat.diffuseTransmissionColorFactor);
   }
   else if(lobe == LOBE_SPECULAR_REFLECTION)
   {
