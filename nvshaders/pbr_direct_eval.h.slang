@@ -204,7 +204,7 @@ float3 _bsdfEvaluatePunctualKhronosCore(PbrMaterial mat,
   float3 metal_fresnel      = schlickFresnel(mat.baseColor, float3(1.0F), absVdotH);
 
   // ----- Diffuse (Lambertian) and diffuse transmission -----
-  float3 l_diffuse = lightIntensity * NdotL * BRDF_lambertian(mat.baseColor);
+  float3 l_diffuse = lightIntensity * NdotL * BRDF_lambertian(mat.baseColor) * shadowTerminatorTerm(L, N, mat.Ns);
   l_diffuse *= (1.0F - mat.diffuseTransmissionFactor);
 
   if(mat.diffuseTransmissionFactor > 0.0F && dot(N, L) < 0.0F)

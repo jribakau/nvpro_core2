@@ -41,6 +41,7 @@ struct PbrMaterial
   float3 T;   // tangent
   float3 B;   // bitangent
   float3 Ng;  // geometric normal
+  float3 Ns;  // smooth normal: the shading normal before normal and detail maps (shadowTerminatorTerm)
 
 
   float ior1;        // index of refraction : current medium (i.e. air)
@@ -95,6 +96,7 @@ PbrMaterial defaultPbrMaterial()
 
   mat.N  = float3(0.0F, 0.0F, 1.0F);
   mat.Ng = float3(0.0F, 0.0F, 1.0F);
+  mat.Ns = float3(0.0F, 0.0F, 1.0F);
   mat.T  = float3(1.0F, 0.0F, 0.0F);
   mat.B  = float3(0.0F, 1.0F, 0.0F);
 
@@ -146,6 +148,7 @@ PbrMaterial defaultPbrMaterial(float3 baseColor, float metallic, float roughness
   mat.roughness   = float2(roughness * roughness);
   mat.Ng          = Ng;
   mat.N           = N;
+  mat.Ns          = N;
   orthonormalBasis(mat.N, mat.T, mat.B);
 
   return mat;

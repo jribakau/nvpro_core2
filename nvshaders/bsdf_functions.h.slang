@@ -413,6 +413,59 @@ int findLobe(PbrMaterial mat, float VdotN, float rndVal, NVSHADERS_INOUT_TYPE(fl
   return lobeFromWeights(weightLobe, rndVal);
 }
 
+/*
+Shadow-terminator softening for a bumped diffuse lobe (Conty Estevez, Lecocq and Stein 2019, "Taming
+the Shadow Terminator"; Unreal's ShadowTerminatorTerm). A normal or detail map tilts `N` away from
+the smooth normal `Ns`, and Lambert's cosine against the tilted normal reaches zero along a hard line
+while the smooth surface is still lit. The term reads the tilt as microfacet roughness and masks the
+light toward `L` with its Smith G1, so it fades out toward the terminator. It is 1 with no bump
+(N = Ns) and for a light along N. Applied to evaluation and sampling alike, it leaves the pdf alone.
+*/
+float shadowTerminatorTerm(float3 L, float3 N, float3 Ns)
+{
+  const float cosD = min(abs(dot(N, Ns)), 1.0f);
+  const float cosI = min(dot(N, L), 1.0f);
+  if(cosI <= 0.0f)
+    return 0.0f;
+  if(cosD >= 1.0f)
+    return 1.0f;
+  const float alpha2 = min(0.125f * (1.0f - cosD * cosD) / max(cosD * cosD, 1e-6f), 1.0f);
+  const float tan2I  = (1.0f - cosI * cosI) / (cosI * cosI);
+  return 2.0f / (1.0f + sqrt(1.0f + alpha2 * tan2I));
+}
+
+/*
+The specular lobes' normal ("don't flip", Quilez; Unreal's AdjustShadingNormal). A normal map can
+tilt `N` so far that a view `V` above the surface (`Ng`) mirrors below it, where a reflection lobe
+sends nothing: black pixels along bumped silhouettes. The normal is then bent back, depending on the
+view, to the half vector between V and the mirror direction laid onto the surface, so the mirror
+direction grazes the surface instead. T and B follow it. Only for a view on Ng's side (the caller
+flips Ng to the ray); the diffuse lobe keeps the map's normal.
+*/
+PbrMaterial bsdfSpecularFrame(PbrMaterial mat, float3 V)
+{
+  if(dot(V, mat.Ng) <= 0.0f)
+    return mat;
+  const float3 R = 2.0f * dot(V, mat.N) * mat.N - V;
+  const float  k = dot(R, mat.Ng);
+  if(k >= 0.0f)
+    return mat;
+  const float3 h = R - k * mat.Ng;
+  mat.N          = dot(h, h) > 1e-12f ? normalize(normalize(h) + V) : mat.Ng;
+  const float3 t = mat.T - mat.N * dot(mat.N, mat.T);
+  if(dot(t, t) > 1e-8f)
+  {
+    const float3 b = cross(mat.N, normalize(t));
+    mat.B          = dot(b, mat.B) < 0.0f ? -b : b;
+    mat.T          = normalize(t);
+  }
+  else
+  {
+    orthonormalBasis(mat.N, mat.T, mat.B);
+  }
+  return mat;
+}
+
 // Evaluates a diffuse lobe.
 void brdf_diffuse_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat, float3 tint)
 {
@@ -427,7 +480,7 @@ void brdf_diffuse_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial 
   data.pdf = nk2 * M_1_PI;
 
   // For a white Lambert material, the bxdf components match the evaluation pdf. (See MDL_renderer.)
-  data.bsdf_diffuse = tint * data.pdf;
+  data.bsdf_diffuse = tint * data.pdf * shadowTerminatorTerm(data.k2, mat.N, mat.Ns);
 }
 
 void brdf_diffuse_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat)
@@ -443,7 +496,7 @@ void brdf_diffuse_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial 
   data.k2  = normalize(data.k2);
   data.pdf = dot(data.k2, mat.N) * M_1_PI;
 
-  data.bsdf_over_pdf = tint;  // bsdf * dot(wi, normal) / pdf;
+  data.bsdf_over_pdf = tint * shadowTerminatorTerm(data.k2, mat.N, mat.Ns);  // bsdf * dot(wi, normal) / pdf;
   data.event_type    = BSDF_EVENT_DIFFUSE_REFLECTION;
 }
 
@@ -496,6 +549,7 @@ void brdf_diffuse_transmission_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data,
 // scattering-masking function.
 void brdf_ggx_smith_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat, const int lobe, float3 tint)
 {
+  mat = bsdfSpecularFrame(mat, data.k1);
   // A reflection lobe has nothing below its hemisphere on either side: the sampler absorbs a view
   // below N (nk1 <= 0) and never produces a direction below it (as the diffuse and sheen evals reject
   // those), so a light sample there had no BSDF-sample partner. A normal map bends N past the view at
@@ -571,6 +625,7 @@ void brdf_ggx_smith_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMateria
   // Make sure the returned values are valid numbers when manipulating the PRD.
   data.bsdf_over_pdf = float3(0.0f);
   data.pdf           = 0.0f;
+  mat                = bsdfSpecularFrame(mat, data.k1);
 
   // Transform to local coordinate system
   const float nk1 = dot(data.k1, mat.N);
@@ -940,6 +995,7 @@ void btdf_ggx_smith_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMateria
 // Evaluates the sheen lobe.
 void brdf_sheen_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat)
 {
+  mat = bsdfSpecularFrame(mat, data.k1);
   // BRDF or BTDF eval?
   // If the incoming light direction is on the backface.
   // Include edge-on (== 0.0f) as "no light" case.
@@ -997,6 +1053,7 @@ void brdf_sheen_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial ma
   // Make sure the returned values are valid numbers when manipulating the PRD.
   data.bsdf_over_pdf = float3(0.0f);
   data.pdf           = 0.0f;
+  mat                = bsdfSpecularFrame(mat, data.k1);
 
   const float invRoughness = 1.0f / (mat.sheenRoughness * mat.sheenRoughness);  // Perceptual roughness to alpha G.
 
