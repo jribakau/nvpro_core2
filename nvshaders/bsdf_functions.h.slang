@@ -40,6 +40,14 @@ equation included; e.g. the Lambert lobe returns `max(0.0f, cos(N, k1)) / pi`.
 Advanced users can use some of the other functions in this file to evaluate
 and sample individual lobes, or subsets of lobes.
 
+`bsdfEvaluate()` picks one lobe at random, as `bsdfSample()` does, and returns
+that lobe's own pdf; the two are a pair for Multiple Importance Sampling.
+`bsdfEvaluateAll()` evaluates every lobe, each by its weight (the mean of
+`bsdfEvaluate()` over `xi.z`), and returns the lobe mixture's pdf; its MIS
+partner is `bsdfSampleMixture()` (or `bsdfSampleCore(..., true)`), which samples
+exactly as `bsdfSample()` does but reports that mixture pdf. Mixing one of one
+pair with one of the other biases the estimate.
+
 This file also provides `bsdfEvaluateSimple()` and `bsdfSampleSimple()`, which
 implement a simpler and faster, though less fully-featured BSDF model. The
 simple model only has diffuse, specular, and metallic lobes, while the full
@@ -374,15 +382,10 @@ ARRAY_TYPE(float, LOBE_COUNT, ) computeLobeWeights(PbrMaterial mat, float VdotN,
   return weightLobe;
 }
 
-/*-------------------------------------------------------------------------------------------------
-# Function `findLobe`
-> Calculates the weights of the individual lobes inside the standard PBR material
-> and randomly selects one.
--------------------------------------------------------------------------------------------------*/
-int findLobe(PbrMaterial mat, float VdotN, float rndVal, NVSHADERS_INOUT_TYPE(float3) tint)
+// findLobe's selection, from weights already computed: walks from the last lobe down and returns lobe 0
+// when nothing else was picked. findLobe = computeLobeWeights + this (bit-identical to before).
+int lobeFromWeights(ARRAY_TYPE(float, LOBE_COUNT, weightLobe), float rndVal)
 {
-  ARRAY_TYPE(float, LOBE_COUNT, weightLobe) = computeLobeWeights(mat, VdotN, tint);
-
   int   lobe   = LOBE_COUNT;
   float weight = 0.0f;
   // Stops when lobe reaches 0! No need to look at weightLobe[0] since we know
@@ -397,6 +400,17 @@ int findLobe(PbrMaterial mat, float VdotN, float rndVal, NVSHADERS_INOUT_TYPE(fl
   }
 
   return lobe;
+}
+
+/*-------------------------------------------------------------------------------------------------
+# Function `findLobe`
+> Calculates the weights of the individual lobes inside the standard PBR material
+> and randomly selects one.
+-------------------------------------------------------------------------------------------------*/
+int findLobe(PbrMaterial mat, float VdotN, float rndVal, NVSHADERS_INOUT_TYPE(float3) tint)
+{
+  ARRAY_TYPE(float, LOBE_COUNT, weightLobe) = computeLobeWeights(mat, VdotN, tint);
+  return lobeFromWeights(weightLobe, rndVal);
 }
 
 // Evaluates a diffuse lobe.
@@ -482,6 +496,17 @@ void brdf_diffuse_transmission_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data,
 // scattering-masking function.
 void brdf_ggx_smith_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat, const int lobe, float3 tint)
 {
+  // A reflection lobe has nothing below its hemisphere on either side: the sampler absorbs a view
+  // below N (nk1 <= 0) and never produces a direction below it (as the diffuse and sheen evals reject
+  // those), so a light sample there had no BSDF-sample partner. A normal map bends N past the view at
+  // silhouettes.
+  if(dot(data.k1, mat.N) <= 0.0f || dot(data.k2, mat.N) <= 0.0f)
+  {
+    data.pdf         = 0.0f;
+    data.bsdf_glossy = float3(0.0f);
+    return;
+  }
+
   const float nk1 = abs(dot(data.k1, mat.N));
   const float nk2 = abs(dot(data.k2, mat.N));
 
@@ -784,7 +809,9 @@ void btdf_ggx_smith_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMateria
     // Refraction pdf and BTDF
     const float tmp = k1h * ior.x - k2h * ior.y;
 
-    data.pdf *= k1h * k2h / (nk1 * nh * tmp * tmp);
+    // The half-vector Jacobian carries eta_t^2 (ior.y), so the pdf integrates to 1 over the refracted
+    // directions; the value is built from it, so both rise together.
+    data.pdf *= ior.y * ior.y * k1h * k2h / (nk1 * nh * tmp * tmp);
   }
   else
   {
@@ -893,10 +920,12 @@ void btdf_ggx_smith_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMateria
 
   if(!isThinWalled && (data.event_type == BSDF_EVENT_GLOSSY_TRANSMISSION))  // if (refraction)
   {
+    // As btdf_ggx_smith_eval's: eta_t^2 in the Jacobian. tmp is negative entering a denser medium and
+    // only its square counts, so the sign must not drop the Jacobian.
     const float tmp = kh * ior.x - k2h * ior.y;
-    if(tmp > 0)
+    if(tmp != 0.0f)
     {
-      data.pdf *= kh * k2h / (nk1 * h0.z * tmp * tmp);
+      data.pdf *= ior.y * ior.y * kh * k2h / (nk1 * h0.z * tmp * tmp);
     }
   }
   else
@@ -1032,19 +1061,29 @@ void brdf_sheen_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial ma
 }
 
 
-/*-------------------------------------------------------------------------------------------------
-# Function `bsdfEvaluateCore`
-> Single-path BSDF evaluation (forward or retro view direction in `data.k1`).
-> Returns the stochastically selected lobe index.
--------------------------------------------------------------------------------------------------*/
-int bsdfEvaluateCore(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat)
+// The clearcoat lobe's material: its normal Nc, its roughness, an orthonormal frame about Nc and no
+// iridescence. Shared by evaluate and sample so their pdfs agree when Nc != N.
+PbrMaterial bsdfClearcoatMaterial(PbrMaterial mat)
 {
-  float3 tint       = mat.baseColor;
-  float  VdotN      = dot(data.k1, mat.N);
-  int    lobe       = findLobe(mat, VdotN, data.xi.z, tint);
-  data.bsdf_diffuse = float3(0, 0, 0);
-  data.bsdf_glossy  = float3(0, 0, 0);
-  data.pdf          = 0.0;
+  mat.roughness   = float2(mat.clearcoatRoughness * mat.clearcoatRoughness);
+  mat.N           = mat.Nc;
+  mat.B           = normalize(cross(mat.N, mat.T));  // Assumes Nc and T are not collinear (as the sampler did)
+  mat.T           = cross(mat.B, mat.N);
+  mat.iridescence = 0.0f;
+  return mat;
+}
+
+/*-------------------------------------------------------------------------------------------------
+# Function `bsdfEvaluateLobe`
+> One lobe of the standard material, unweighted, without occlusion or retroreflection: its value
+> (cosine included) and its own pdf. `tint` is computeLobeWeights' (iridescence-modified) base
+> colour, used by the diffuse reflection and specular transmission lobes only.
+-------------------------------------------------------------------------------------------------*/
+void bsdfEvaluateLobe(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat, int lobe, float3 tint)
+{
+  data.bsdf_diffuse = float3(0.0f);
+  data.bsdf_glossy  = float3(0.0f);
+  data.pdf          = 0.0f;
 
   if(lobe == LOBE_DIFFUSE_REFLECTION)
   {
@@ -1072,17 +1111,26 @@ int bsdfEvaluateCore(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial ma
   }
   else if(lobe == LOBE_CLEARCOAT_REFLECTION)
   {
-    mat.roughness   = float2(mat.clearcoatRoughness * mat.clearcoatRoughness);
-    mat.N           = mat.Nc;
-    mat.iridescence = 0.0f;
-    brdf_ggx_smith_eval(data, mat, LOBE_CLEARCOAT_REFLECTION, float3(1, 1, 1));
+    brdf_ggx_smith_eval(data, bsdfClearcoatMaterial(mat), LOBE_CLEARCOAT_REFLECTION, float3(1.0f));
   }
   else if(lobe == LOBE_SHEEN_REFLECTION)
   {
     brdf_sheen_eval(data, mat);
   }
+}
 
-  // Occlusion effect (glTF occlusion texture)
+/*-------------------------------------------------------------------------------------------------
+# Function `bsdfEvaluateCore`
+> Single-path BSDF evaluation (forward or retro view direction in `data.k1`).
+> Returns the stochastically selected lobe index.
+-------------------------------------------------------------------------------------------------*/
+int bsdfEvaluateCore(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat)
+{
+  float3    tint = mat.baseColor;
+  const int lobe = findLobe(mat, dot(data.k1, mat.N), data.xi.z, tint);
+  bsdfEvaluateLobe(data, mat, lobe, tint);
+
+  // Occlusion effect (glTF occlusion texture): the bsdf, never the pdf
   data.bsdf_diffuse *= mat.occlusion;
   data.bsdf_glossy *= mat.occlusion;
 
@@ -1135,6 +1183,103 @@ void bsdfEvaluate(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat)
   }
 }
 
+// One lobe with the MRM blend on the base lobes (diffuse, specular, metal): value and pdf are
+// lerp(at k1, at reflect(-k1, N), b). reflect(-k1, N) has the same N.k1, so the weights and tint are
+// the forward ones.
+void bsdfEvaluateLobeBlended(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat, int lobe, float3 tint)
+{
+  bsdfEvaluateLobe(data, mat, lobe, tint);
+  const float blend = mat.retroreflection;
+  if(blend > 0.0f && isRetroreflectionLobe(lobe))
+  {
+    BsdfEvaluateData r;
+    r.k1 = reflect(-data.k1, mat.N);
+    r.k2 = data.k2;
+    r.xi = data.xi;
+    bsdfEvaluateLobe(r, mat, lobe, tint);
+    data.bsdf_diffuse = lerp(data.bsdf_diffuse, r.bsdf_diffuse, blend);
+    data.bsdf_glossy  = lerp(data.bsdf_glossy, r.bsdf_glossy, blend);
+    data.pdf          = lerp(data.pdf, r.pdf, blend);
+  }
+}
+
+// True when value and pdf are finite numbers.
+bool bsdfLobeFinite(BsdfEvaluateData d)
+{
+  return !(isnan(d.pdf) || isinf(d.pdf) || any(isnan(d.bsdf_diffuse)) || any(isinf(d.bsdf_diffuse))
+           || any(isnan(d.bsdf_glossy)) || any(isinf(d.bsdf_glossy)));
+}
+
+// Adds s * lobe(at.k1, at.k2) to acc. A lobe with s <= 0, a non-finite value or pdf, or pdf <= 0 adds
+// nothing -- on both MIS sides alike, since both call this. Returns false only when `lobe` is
+// `sampledLobe` and was dropped: that BSDF sample has no light-sample partner.
+bool bsdfAccumulateLobe(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) acc, BsdfEvaluateData at, PbrMaterial mat, int lobe, float s, float3 tint, int sampledLobe)
+{
+  if(!(s > 0.0f))  // zero-weight lobes cost one compare
+    return lobe != sampledLobe;
+  BsdfEvaluateData d;
+  d.k1 = at.k1;
+  d.k2 = at.k2;
+  d.xi = at.xi;
+  bsdfEvaluateLobeBlended(d, mat, lobe, tint);
+  if(!bsdfLobeFinite(d) || !(d.pdf > 0.0f))
+    return lobe != sampledLobe;
+  acc.bsdf_diffuse += s * d.bsdf_diffuse;
+  acc.bsdf_glossy += s * d.bsdf_glossy;
+  acc.pdf += s * d.pdf;
+  return true;
+}
+
+/*-------------------------------------------------------------------------------------------------
+# Function `bsdfEvaluateSumWeighted`
+> The whole BSDF at (k1, k2) for lobe weights `s` and `tint` that computeLobeWeights gave at k1:
+> bsdf_diffuse/bsdf_glossy = occlusion * sum_j s_j g_j (the mean of bsdfEvaluate over xi.z) and
+> pdf = q = sum_j s_j p_j. xi.z only picks the dispersion wavelength. Returns false if `sampledLobe`
+> (>= 0) was dropped. Lobes are listed with constant indices so the weight array stays in registers.
+-------------------------------------------------------------------------------------------------*/
+bool bsdfEvaluateSumWeighted(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat, ARRAY_TYPE(float, LOBE_COUNT, s), float3 tint, int sampledLobe)
+{
+  BsdfEvaluateData acc;
+  acc.k1           = data.k1;
+  acc.k2           = data.k2;
+  acc.xi           = data.xi;
+  acc.bsdf_diffuse = float3(0.0f);
+  acc.bsdf_glossy  = float3(0.0f);
+  acc.pdf          = 0.0f;
+  bool covered     = true;
+  covered = bsdfAccumulateLobe(acc, data, mat, LOBE_CLEARCOAT_REFLECTION, s[LOBE_CLEARCOAT_REFLECTION], tint, sampledLobe) && covered;
+  covered = bsdfAccumulateLobe(acc, data, mat, LOBE_SHEEN_REFLECTION, s[LOBE_SHEEN_REFLECTION], tint, sampledLobe) && covered;
+  covered = bsdfAccumulateLobe(acc, data, mat, LOBE_METAL_REFLECTION, s[LOBE_METAL_REFLECTION], tint, sampledLobe) && covered;
+  covered = bsdfAccumulateLobe(acc, data, mat, LOBE_SPECULAR_REFLECTION, s[LOBE_SPECULAR_REFLECTION], tint, sampledLobe) && covered;
+  covered = bsdfAccumulateLobe(acc, data, mat, LOBE_SPECULAR_TRANSMISSION, s[LOBE_SPECULAR_TRANSMISSION], tint, sampledLobe) && covered;
+  covered = bsdfAccumulateLobe(acc, data, mat, LOBE_DIFFUSE_TRANSMISSION, s[LOBE_DIFFUSE_TRANSMISSION], tint, sampledLobe) && covered;
+  covered = bsdfAccumulateLobe(acc, data, mat, LOBE_DIFFUSE_REFLECTION, s[LOBE_DIFFUSE_REFLECTION], tint, sampledLobe) && covered;
+  // Occlusion effect (glTF occlusion texture): the bsdf, never the pdf
+  data.bsdf_diffuse = acc.bsdf_diffuse * mat.occlusion;
+  data.bsdf_glossy  = acc.bsdf_glossy * mat.occlusion;
+  data.pdf          = acc.pdf;
+  return covered;
+}
+
+// bsdfEvaluateSumWeighted with the weights computed here, at data.k1.
+bool bsdfEvaluateSum(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat, int sampledLobe)
+{
+  float3 tint = mat.baseColor;
+  ARRAY_TYPE(float, LOBE_COUNT, s) = computeLobeWeights(mat, dot(data.k1, mat.N), tint);
+  return bsdfEvaluateSumWeighted(data, mat, s, tint, sampledLobe);
+}
+
+/*-------------------------------------------------------------------------------------------------
+# Function `bsdfEvaluateAll`
+> Next-event estimation's evaluation of every lobe (see bsdfEvaluateSumWeighted). Its pdf is the lobe
+> mixture's: for MIS, pair it with bsdfSampleMixture (or bsdfSampleCore(..., true)) on the BSDF side,
+> never with bsdfSample.
+-------------------------------------------------------------------------------------------------*/
+void bsdfEvaluateAll(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat)
+{
+  bsdfEvaluateSum(data, mat, -1);
+}
+
 
 /*-------------------------------------------------------------------------------------------------
 # Function `bsdfSampleLobe`
@@ -1171,12 +1316,7 @@ void bsdfSampleLobe(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat, 
   }
   else if(lobe == LOBE_CLEARCOAT_REFLECTION)
   {
-    mat.roughness   = float2(mat.clearcoatRoughness * mat.clearcoatRoughness);
-    mat.N           = mat.Nc;
-    mat.B           = normalize(cross(mat.N, mat.T));  // Assumes Nc and Tc are not collinear!
-    mat.T           = cross(mat.B, mat.N);
-    mat.iridescence = 0.0f;
-    brdf_ggx_smith_sample(data, mat, LOBE_CLEARCOAT_REFLECTION, float3(1, 1, 1));
+    brdf_ggx_smith_sample(data, bsdfClearcoatMaterial(mat), LOBE_CLEARCOAT_REFLECTION, float3(1.0f));
   }
   else if(lobe == LOBE_SHEEN_REFLECTION)
   {
@@ -1219,6 +1359,58 @@ float bsdfSampleRetroreflectionPath(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, P
 }
 
 /*-------------------------------------------------------------------------------------------------
+# Function `bsdfSampleCore`
+> bsdfSample's body; returns the sampled lobe. Restores k1 and xi afterwards (the MRM path mirrors k1
+> and both MRM and the lobe choice re-hash xi.z). With `mixturePdf`, `pdf` is the lobe mixture's q(k2)
+> from bsdfEvaluateSumWeighted with this vertex's weights, the pdf next-event estimation's
+> bsdfEvaluateAll weighs against, or DIRAC when no light sample is this direction's partner (an
+> impulse, or a direction where the sampled lobe's own evaluation adds nothing). Direction, event and
+> bsdf_over_pdf never depend on `mixturePdf`.
+-------------------------------------------------------------------------------------------------*/
+int bsdfSampleCore(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat, bool mixturePdf)
+{
+  // Select lobe with the forward view direction, then optionally apply MRM only on
+  // retroreflection-eligible lobes (see isRetroreflectionLobe: diffuse/specular/metal
+  // reflection, not transmission, clearcoat, or sheen).
+  const float3 k1   = data.k1;
+  const float3 xi   = data.xi;
+  float3       tint = mat.baseColor;
+  ARRAY_TYPE(float, LOBE_COUNT, s) = computeLobeWeights(mat, dot(k1, mat.N), tint);
+  const int lobe = lobeFromWeights(s, xi.z);
+
+  const float blend    = mat.retroreflection;
+  const bool  hasRetro = blend > 0.0f && isRetroreflectionLobe(lobe);
+  if(hasRetro)
+  {
+    data.xi.z = rerandomize(data.xi.z);
+    bsdfSampleRetroreflectionPath(data, mat, blend);  // picks a path with probability = its blend weight; may mirror k1
+  }
+  bsdfSampleLobe(data, mat, lobe, tint);
+  data.k1 = k1;
+  data.xi = xi;
+  if(data.event_type == BSDF_EVENT_ABSORB || data.pdf == DIRAC)
+    return lobe;
+
+  BsdfEvaluateData e;
+  e.k1 = k1;
+  e.k2 = data.k2;
+  e.xi = xi;  // the original xi.z: a sampled transmission drew its wavelength from it (never the MRM path)
+  if(mixturePdf)
+  {
+    const bool covered = bsdfEvaluateSumWeighted(e, mat, s, tint, lobe);
+    data.pdf           = (covered && e.pdf > 0.0f) ? e.pdf : DIRAC;
+  }
+  else if(hasRetro)
+  {
+    // MRM: each path is picked as often as it weighs in the blend, so the throughput is the path's own
+    // bsdf/pdf, undivided. The direction's density is the lobe's blended pdf, as bsdfEvaluate gives it.
+    bsdfEvaluateLobeBlended(e, mat, lobe, tint);
+    data.pdf = (bsdfLobeFinite(e) && e.pdf > 0.0f) ? e.pdf : DIRAC;  // not covered: no light-sample partner
+  }
+  return lobe;
+}
+
+/*-------------------------------------------------------------------------------------------------
 # Function `bsdfSample`
 
 > Samples the full BSDF model for the given material and input direction.
@@ -1234,35 +1426,24 @@ There are two things you should check after calling this function:
 * Is `data.pdf` equal to `DIRAC`? If so, this sampled a perfectly specular lobe.
   If you're using Multiple Importance Sampling weights, you should compute them
   as if `data.pdf` was infinity.
-  
+
+`data.pdf` is the density of the sampled lobe alone, the one `bsdfEvaluate`
+returns for that lobe. To weigh against `bsdfEvaluateAll` instead, use
+`bsdfSampleMixture`.
 -------------------------------------------------------------------------------------------------*/
 void bsdfSample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat)
 {
-  // Select lobe with the forward view direction, then optionally apply MRM only on
-  // retroreflection-eligible lobes (see isRetroreflectionLobe: diffuse/specular/metal
-  // reflection, not transmission, clearcoat, or sheen).
-  float3 tint  = mat.baseColor;
-  float  VdotN = dot(data.k1, mat.N);
-  int    lobe  = findLobe(mat, VdotN, data.xi.z, tint);
+  bsdfSampleCore(data, mat, false);
+}
 
-  float       pathProb = 1.0f;
-  const float blend    = mat.retroreflection;
-  const bool  hasRetro = blend > 0.0f && isRetroreflectionLobe(lobe);
-  if(hasRetro)
-  {
-    data.xi.z = rerandomize(data.xi.z);
-    pathProb  = bsdfSampleRetroreflectionPath(data, mat, blend);
-  }
-
-  bsdfSampleLobe(data, mat, lobe, tint);
-
-  // If we have retroreflection and we didn't get absorption, account for the path selection probability.
-  if(hasRetro && pathProb > 0.0f && data.event_type != BSDF_EVENT_ABSORB)
-  {
-    data.bsdf_over_pdf /= pathProb;
-    if(data.pdf != DIRAC)
-      data.pdf *= pathProb;
-  }
+/*-------------------------------------------------------------------------------------------------
+# Function `bsdfSampleMixture`
+> bsdfSample with the pdf MIS needs when next-event estimation uses bsdfEvaluateAll: the lobe
+> mixture's q at the sampled direction, or `DIRAC` where no light sample is its partner.
+-------------------------------------------------------------------------------------------------*/
+void bsdfSampleMixture(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat)
+{
+  bsdfSampleCore(data, mat, true);
 }
 
 /*-------------------------------------------------------------------------------------------------
