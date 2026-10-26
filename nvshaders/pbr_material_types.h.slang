@@ -42,6 +42,9 @@ struct PbrMaterial
   float3 B;   // bitangent
   float3 Ng;  // geometric normal
   float3 Ns;  // smooth normal: the shading normal before normal and detail maps (shadowTerminatorTerm)
+  // Per channel, 0..1: how much of the diffuse reflection lobe turns about Ns instead of N, as light
+  // that spreads under a surface evens out the bumps it entered by (brdf_diffuse_eval). 0: none.
+  float3 diffuseSoftening;
 
 
   float ior1;        // index of refraction : current medium (i.e. air)
@@ -97,6 +100,7 @@ PbrMaterial defaultPbrMaterial()
   mat.N  = float3(0.0F, 0.0F, 1.0F);
   mat.Ng = float3(0.0F, 0.0F, 1.0F);
   mat.Ns = float3(0.0F, 0.0F, 1.0F);
+  mat.diffuseSoftening = float3(0.0F);
   mat.T  = float3(1.0F, 0.0F, 0.0F);
   mat.B  = float3(0.0F, 1.0F, 0.0F);
 

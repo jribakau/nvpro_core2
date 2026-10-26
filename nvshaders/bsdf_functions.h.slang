@@ -466,9 +466,44 @@ PbrMaterial bsdfSpecularFrame(PbrMaterial mat, float3 V)
   return mat;
 }
 
+/*
+The softened diffuse lobe (`mat.diffuseSoftening` s, per channel): a Lambert lobe about the map's
+normal N with weight 1 - s and one about the smooth normal Ns with weight s, as light that spreads
+under a surface evens out the bumps it entered by, its red the most. It is sampled from the same two
+lobes mixed by the channels' mean weight, so the sample weight stays within max((1 - s) / pN,
+s / (1 - pN)) of the colour.
+*/
+float diffuseSofteningMixN(PbrMaterial mat)
+{
+  return 1.0f - (mat.diffuseSoftening.x + mat.diffuseSoftening.y + mat.diffuseSoftening.z) / 3.0f;
+}
+
+// Value (cosine included) and pdf of the softened diffuse lobe toward `k2`.
+void brdf_diffuse_softened(PbrMaterial mat, float3 tint, float3 k2, NVSHADERS_OUT_TYPE(float3) value, NVSHADERS_OUT_TYPE(float) pdf)
+{
+  const float  cosN = max(dot(k2, mat.N), 0.0f);
+  const float  cosS = max(dot(k2, mat.Ns), 0.0f);
+  const float  pN   = diffuseSofteningMixN(mat);
+  const float3 s    = mat.diffuseSoftening;
+  pdf               = (pN * cosN + (1.0f - pN) * cosS) * M_1_PI;
+  value = tint * M_1_PI * ((float3(1.0f) - s) * (cosN * shadowTerminatorTerm(k2, mat.N, mat.Ns)) + s * cosS);
+}
+
 // Evaluates a diffuse lobe.
 void brdf_diffuse_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat, float3 tint)
 {
+  if(max(mat.diffuseSoftening.x, max(mat.diffuseSoftening.y, mat.diffuseSoftening.z)) > 0.0f)
+  {
+    float3 value;
+    float  pdf;
+    brdf_diffuse_softened(mat, tint, data.k2, value, pdf);
+    if(pdf <= 0.0f)
+      return;  // absorb
+    data.pdf          = pdf;
+    data.bsdf_diffuse = value;
+    return;
+  }
+
   // If the incoming light direction is on the backside, there is nothing to evaluate for a BRDF.
   // Note that the state normals have been flipped to the ray side by the caller.
   // Include edge-on (== 0.0f) as "no light" case.
@@ -491,6 +526,34 @@ void brdf_diffuse_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial 
 // Samples a diffuse lobe.
 void brdf_diffuse_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat, float3 tint)
 {
+  if(max(mat.diffuseSoftening.x, max(mat.diffuseSoftening.y, mat.diffuseSoftening.z)) > 0.0f)
+  {
+    // One of the two lobes by the mean weight, xi.x stretched back over [0, 1)
+    const float pN     = diffuseSofteningMixN(mat);
+    float       xi     = data.xi.x;
+    const bool  aboutN = xi < pN;
+    xi                 = aboutN ? xi / pN : (xi - pN) / max(1.0f - pN, 1e-6f);
+    float3 T = mat.T, B = mat.B, N = mat.N;
+    if(!aboutN)
+    {
+      N = mat.Ns;
+      orthonormalBasis(N, T, B);
+    }
+    const float3 local = cosineSampleHemisphere(min(xi, 0.99999994f), data.xi.y);
+    data.k2            = normalize(T * local.x + B * local.y + N * local.z);
+    float3 value;
+    brdf_diffuse_softened(mat, tint, data.k2, value, data.pdf);
+    if(data.pdf <= 0.0f)
+    {
+      data.bsdf_over_pdf = float3(0.0f);
+      data.event_type    = BSDF_EVENT_ABSORB;
+      return;
+    }
+    data.bsdf_over_pdf = value / data.pdf;
+    data.event_type    = BSDF_EVENT_DIFFUSE_REFLECTION;
+    return;
+  }
+
   data.k2  = cosineSampleHemisphere(data.xi.x, data.xi.y);
   data.k2  = mat.T * data.k2.x + mat.B * data.k2.y + mat.N * data.k2.z;
   data.k2  = normalize(data.k2);
