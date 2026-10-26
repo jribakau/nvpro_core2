@@ -284,6 +284,74 @@ float fresnelCosineApproximation(float VdotN, float roughness)
   return lerp(VdotN, sqrt(0.5F + 0.5F * VdotN), sqrt(roughness));
 }
 
+// How a reflection lobe weighs its microfacets (brdf_ggx_smith_eval / _sample `fresnel`)
+#define BSDF_FRESNEL_NONE 0        // not at all: the lobe weights carry it
+#define BSDF_FRESNEL_DIELECTRIC 1  // ior_fresnel(eta, k1.h), the exact dielectric's
+#define BSDF_FRESNEL_SCHLICK 2     // Schlick's from the tint (a metal's base colour) to white at k1.h
+
+/*-------------------------------------------------------------------------------------------------
+# Function `ggxSchlickAlbedo`
+> The directional albedo of a GGX-Smith reflection lobe of roughness `alpha` with Schlick's Fresnel
+> from `f0` to 1, at view cosine `NoV`: f0 * scale + bias, by the fit of Ray Tracing Gems chapter 32
+> (as EnvBRDFApprox2).
+-------------------------------------------------------------------------------------------------*/
+float ggxSchlickAlbedo(float f0, float alpha, float NoV)
+{
+  const float x      = clamp(NoV, 0.0F, 1.0F);
+  const float x2     = x * x;
+  const float x3     = x2 * x;
+  const float a      = clamp(alpha, 0.0F, 1.0F);
+  const float a3     = a * a * a;
+  const float biasN  = (0.99044F - 1.28514F * x) + a * (1.29678F - 0.755907F * x);
+  const float biasD  = (1.0F + 2.92338F * x + 59.4188F * x3) + a * (20.3225F - 27.0302F * x + 222.592F * x3)
+                      + a3 * (121.563F + 626.13F * x + 316.627F * x3);
+  const float scaleN = (0.0365463F + 3.32707F * x) + a * (9.0632F - 9.04756F * x);
+  const float scaleD = (1.0F + 3.59685F * x2 - 1.36772F * x3) + a * (9.04401F - 16.3174F * x2 + 9.22949F * x3)
+                       + a3 * (5.56589F + 19.7886F * x2 - 20.2123F * x3);
+  return clamp(f0 * max(scaleN / scaleD, 0.0F) + max(biasN / biasD, 0.0F), 0.0F, 1.0F);
+}
+
+float dielectricF0(float eta)
+{
+  const float r = (eta - 1.0F) / (eta + 1.0F);
+  return r * r;
+}
+
+/*-------------------------------------------------------------------------------------------------
+# Function `bsdfFresnelInLobes`
+> Whether the dielectric lobes weigh each microfacet by its own Fresnel (at k1.h), as a microfacet
+> dielectric does, instead of the whole lobe by one Fresnel at an estimated angle. The reflection then
+> rises at grazing light as it should, and what it leaves goes to the layers below by the lobe's
+> albedo at the view (Unreal's and Kulla and Conty's albedo scaling). Not on the denser side of the
+> boundary, where the albedo fit knows no total internal reflection, nor with iridescence, whose
+> thin-film factor stays the estimated one: both keep the lobe weights' Fresnel.
+-------------------------------------------------------------------------------------------------*/
+bool bsdfFresnelInLobes(PbrMaterial mat)
+{
+  return mat.iridescence <= 0.0F && mat.ior2 >= mat.ior1;
+}
+
+// The share of the light at view cosine `VdotN` the dielectric specular lobe reflects
+// (bsdfFresnelInLobes): specular, its colour's largest channel, and the lobe's albedo
+float bsdfSpecularAlbedo(PbrMaterial mat, float VdotN)
+{
+  const float colour = min(max(mat.specularColor.x, max(mat.specularColor.y, mat.specularColor.z)), 1.0F);
+  const float alpha  = 0.5F * (mat.roughness.x + mat.roughness.y);
+  return clamp(mat.specular * colour * ggxSchlickAlbedo(dielectricF0(mat.ior2 / mat.ior1), alpha, VdotN), 0.0F, 1.0F);
+}
+
+// The clearcoat's, likewise: its index 1.5 against ior1, its own roughness
+bool bsdfClearcoatFresnelInLobe(PbrMaterial mat)
+{
+  return 1.5F >= mat.ior1;
+}
+
+float bsdfClearcoatAlbedo(PbrMaterial mat, float VdotN)
+{
+  const float alpha = mat.clearcoatRoughness * mat.clearcoatRoughness;
+  return clamp(mat.clearcoat * ggxSchlickAlbedo(dielectricF0(1.5F / mat.ior1), alpha, VdotN), 0.0F, 1.0F);
+}
+
 /*-------------------------------------------------------------------------------------------------
 # Function `computeLobeWeights`
 >Calculates the weights of the individual lobes inside the standard PBR material.
@@ -304,18 +372,33 @@ ARRAY_TYPE(float, LOBE_COUNT, ) computeLobeWeights(PbrMaterial mat, float VdotN,
   float frCoat = 0.0F;
   if(mat.clearcoat > 0.0f)
   {
-    float frCosineClearcoat = fresnelCosineApproximation(VdotN, mat.clearcoatRoughness);
-    frCoat                  = mat.clearcoat * ior_fresnel(1.5f / mat.ior1, frCosineClearcoat);
+    if(bsdfClearcoatFresnelInLobe(mat))
+    {
+      frCoat = bsdfClearcoatAlbedo(mat, VdotN);
+    }
+    else
+    {
+      float frCosineClearcoat = fresnelCosineApproximation(VdotN, mat.clearcoatRoughness);
+      frCoat                  = mat.clearcoat * ior_fresnel(1.5f / mat.ior1, frCosineClearcoat);
+    }
   }
 
   // This Fresnel value defines the weighting between dielectric specular reflection and
-  // the base dielectric BSDFs (diffuse reflection and specular transmission).
+  // the base dielectric BSDFs (diffuse reflection and specular transmission): the reflection lobe's
+  // albedo at the view when its microfacets carry their own Fresnel (bsdfFresnelInLobes).
   float frDielectric = 0;
   if(mat.specular > 0)
   {
-    float frCosineDielectric = fresnelCosineApproximation(VdotN, (mat.roughness.x + mat.roughness.y) * 0.5F);
-    frDielectric             = ior_fresnel(mat.ior2 / mat.ior1, frCosineDielectric);
-    frDielectric *= mat.specular;
+    if(bsdfFresnelInLobes(mat))
+    {
+      frDielectric = bsdfSpecularAlbedo(mat, VdotN);
+    }
+    else
+    {
+      float frCosineDielectric = fresnelCosineApproximation(VdotN, (mat.roughness.x + mat.roughness.y) * 0.5F);
+      frDielectric             = ior_fresnel(mat.ior2 / mat.ior1, frCosineDielectric);
+      frDielectric *= mat.specular;
+    }
   }
 
   // Estimate the iridescence Fresnel factor with the angle to the normal, and
@@ -608,9 +691,19 @@ void brdf_diffuse_transmission_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data,
 }
 
 
+// The Fresnel a reflection lobe weighs a microfacet by (BSDF_FRESNEL_*), at k1.h
+float3 bsdfMicrofacetFresnel(int fresnel, float eta, float3 tint, float k1h)
+{
+  if(fresnel == BSDF_FRESNEL_DIELECTRIC)
+    return tint * ior_fresnel(eta, k1h);
+  if(fresnel == BSDF_FRESNEL_SCHLICK)
+    return schlickFresnel(tint, float3(1.0F), k1h);
+  return tint;
+}
+
 // Evaluates a reflective lobe with a GGX NDF and an uncorrelated Smith
-// scattering-masking function.
-void brdf_ggx_smith_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat, const int lobe, float3 tint)
+// scattering-masking function. `fresnel`, `eta`: how each microfacet's reflection is weighed.
+void brdf_ggx_smith_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat, const int lobe, float3 tint, int fresnel, float eta)
 {
   mat = bsdfSpecularFrame(mat, data.k1);
   // A reflection lobe has nothing below its hemisphere on either side: the sampler absorbs a view
@@ -660,6 +753,8 @@ void brdf_ggx_smith_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMateria
 
   data.pdf *= G1;
 
+  tint = bsdfMicrofacetFresnel(fresnel, eta, tint, k1h);
+
   if(mat.iridescence > 0.0f)
   {
     const float3 factor = thin_film_factor(mat.iridescenceThickness, mat.iridescenceIor, mat.ior2, mat.ior1, k1h);
@@ -681,8 +776,8 @@ void brdf_ggx_smith_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMateria
 }
 
 // Samples a reflective lobe with a GGX NDF and an uncorrelated Smith
-// scattering-masking function.
-void brdf_ggx_smith_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat, const int lobe, float3 tint)
+// scattering-masking function. `fresnel`, `eta`: as brdf_ggx_smith_eval's.
+void brdf_ggx_smith_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat, const int lobe, float3 tint, int fresnel, float eta)
 {
   // When the sampling returns eventType = BSDF_EVENT_ABSORB, the path ends inside the ray generation program.
   // Make sure the returned values are valid numbers when manipulating the PRD.
@@ -748,6 +843,8 @@ void brdf_ggx_smith_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMateria
   // Compute pdf
   data.pdf = hvd_ggx_eval(1.0f / mat.roughness, h0) * G1;
   data.pdf *= 0.25f / (nk1 * h0.z);
+
+  tint = bsdfMicrofacetFresnel(fresnel, eta, tint, kh);
 
   if(mat.iridescence > 0.0f)
   {
@@ -855,7 +952,9 @@ float3 wavelengthToRGB(float x)
 
 
 // Evaluates the transmission lobe.
-void btdf_ggx_smith_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat, float3 tint)
+// `reflected`: what each microfacet's reflection takes from what it transmits, times its Fresnel at
+// k1.h (bsdfFresnelInLobes, the reflection being the specular lobe's); 0 when the lobe weights carry it.
+void btdf_ggx_smith_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat, float3 tint, float3 reflected)
 {
   bool isThinWalled = (mat.thickness == 0.0F);
 
@@ -943,13 +1042,16 @@ void btdf_ggx_smith_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMateria
 
   data.pdf *= prob * G1;
 
+  if(backside)
+    tint *= max(float3(1.0F) - reflected * ior_fresnel(ior.y / ior.x, k1h), float3(0.0F));
+
   // eval output: (glossy part of the) bsdf * dot(k2, normal)
   data.bsdf_glossy = bsdf * tint;
 }
 
 
-// Samples the transmission lobe.
-void btdf_ggx_smith_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat, float3 tint)
+// Samples the transmission lobe. `reflected`: as btdf_ggx_smith_eval's.
+void btdf_ggx_smith_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat, float3 tint, float3 reflected)
 {
   bool isThinWalled = (mat.thickness == 0.0F);
 
@@ -1050,6 +1152,9 @@ void btdf_ggx_smith_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMateria
   {
     data.pdf *= 0.25f / (nk1 * h0.z);
   }
+
+  if(data.event_type == BSDF_EVENT_GLOSSY_TRANSMISSION)
+    tint *= max(float3(1.0F) - reflected * ior_fresnel(ior.y / ior.x, kh), float3(0.0F));
 
   data.bsdf_over_pdf *= tint;
 }
@@ -1194,6 +1299,68 @@ PbrMaterial bsdfClearcoatMaterial(PbrMaterial mat)
 }
 
 /*-------------------------------------------------------------------------------------------------
+# Function `bsdfLobeFresnel`
+> How a reflection or transmission lobe carries its Fresnel, at view cosine `VdotN` (the one
+> computeLobeWeights was given), with computeLobeWeights' `tint`. Weighed per microfacet, the lobe's
+> value is divided by the albedo its weight carries, so weight times value is the microfacet BSDF
+> whatever the albedo fit's error: that error only moves light between the lobe's share and the
+> layers' below.
+-------------------------------------------------------------------------------------------------*/
+struct BsdfLobeFresnel
+{
+  float3 tint;
+  int    fresnel;    // BSDF_FRESNEL_*, for the reflection lobes
+  float  eta;        // for BSDF_FRESNEL_DIELECTRIC
+  float3 reflected;  // the transmission lobe's: what each microfacet's reflection takes from it
+};
+
+BsdfLobeFresnel bsdfLobeFresnel(PbrMaterial mat, int lobe, float VdotN, float3 tint)
+{
+  BsdfLobeFresnel f;
+  f.tint      = tint;
+  f.fresnel   = BSDF_FRESNEL_NONE;
+  f.eta       = 1.0F;
+  f.reflected = float3(0.0F);
+  if(lobe == LOBE_SPECULAR_REFLECTION)
+  {
+    f.tint = mat.specularColor;
+    if(bsdfFresnelInLobes(mat))
+    {
+      f.tint    = mat.specularColor * (mat.specular / max(bsdfSpecularAlbedo(mat, VdotN), 1e-6F));
+      f.fresnel = BSDF_FRESNEL_DIELECTRIC;
+      f.eta     = mat.ior2 / mat.ior1;
+    }
+  }
+  else if(lobe == LOBE_SPECULAR_TRANSMISSION)
+  {
+    // `transmissionTint` is float3(1) for plain glTF materials; see PbrMaterial.
+    f.tint = tint * mat.transmissionTint;
+    if(bsdfFresnelInLobes(mat) && mat.specular > 0.0F)
+    {
+      f.tint      = f.tint / max(1.0F - bsdfSpecularAlbedo(mat, VdotN), 1e-6F);
+      f.reflected = mat.specular * mat.specularColor;
+    }
+  }
+  else if(lobe == LOBE_METAL_REFLECTION)
+  {
+    // glTF's metal: Schlick's from the base colour. Iridescence keeps the plain base colour.
+    f.tint    = mat.baseColor;
+    f.fresnel = mat.iridescence <= 0.0F ? BSDF_FRESNEL_SCHLICK : BSDF_FRESNEL_NONE;
+  }
+  else if(lobe == LOBE_CLEARCOAT_REFLECTION)
+  {
+    f.tint = float3(1.0F);
+    if(bsdfClearcoatFresnelInLobe(mat))
+    {
+      f.tint    = float3(mat.clearcoat / max(bsdfClearcoatAlbedo(mat, VdotN), 1e-6F));
+      f.fresnel = BSDF_FRESNEL_DIELECTRIC;
+      f.eta     = 1.5F / mat.ior1;
+    }
+  }
+  return f;
+}
+
+/*-------------------------------------------------------------------------------------------------
 # Function `bsdfEvaluateLobe`
 > One lobe of the standard material, unweighted, without occlusion or retroreflection: its value
 > (cosine included) and its own pdf. `tint` is computeLobeWeights' (iridescence-modified) base
@@ -1216,22 +1383,20 @@ void bsdfEvaluateLobe(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial m
     // which only applies to the dielectric base / specular layers).
     brdf_diffuse_transmission_eval(data, mat, mat.diffuseTransmissionColorFactor);
   }
-  else if(lobe == LOBE_SPECULAR_REFLECTION)
+  else if(lobe == LOBE_SPECULAR_REFLECTION || lobe == LOBE_METAL_REFLECTION)
   {
-    brdf_ggx_smith_eval(data, mat, LOBE_SPECULAR_REFLECTION, mat.specularColor);
+    const BsdfLobeFresnel f = bsdfLobeFresnel(mat, lobe, dot(data.k1, mat.N), tint);
+    brdf_ggx_smith_eval(data, mat, lobe, f.tint, f.fresnel, f.eta);
   }
   else if(lobe == LOBE_SPECULAR_TRANSMISSION)
   {
-    // `transmissionTint` is float3(1) for plain glTF materials; see PbrMaterial.
-    btdf_ggx_smith_eval(data, mat, tint * mat.transmissionTint);
-  }
-  else if(lobe == LOBE_METAL_REFLECTION)
-  {
-    brdf_ggx_smith_eval(data, mat, LOBE_METAL_REFLECTION, mat.baseColor);
+    const BsdfLobeFresnel f = bsdfLobeFresnel(mat, lobe, dot(data.k1, mat.N), tint);
+    btdf_ggx_smith_eval(data, mat, f.tint, f.reflected);
   }
   else if(lobe == LOBE_CLEARCOAT_REFLECTION)
   {
-    brdf_ggx_smith_eval(data, bsdfClearcoatMaterial(mat), LOBE_CLEARCOAT_REFLECTION, float3(1.0f));
+    const BsdfLobeFresnel f = bsdfLobeFresnel(mat, lobe, dot(data.k1, mat.N), tint);
+    brdf_ggx_smith_eval(data, bsdfClearcoatMaterial(mat), LOBE_CLEARCOAT_REFLECTION, f.tint, f.fresnel, f.eta);
   }
   else if(lobe == LOBE_SHEEN_REFLECTION)
   {
@@ -1421,22 +1586,20 @@ void bsdfSampleLobe(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat, 
     // independent of `baseColor`. Pass it directly; see brdf_diffuse_transmission_eval dispatch.
     brdf_diffuse_transmission_sample(data, mat, mat.diffuseTransmissionColorFactor);
   }
-  else if(lobe == LOBE_SPECULAR_REFLECTION)
+  else if(lobe == LOBE_SPECULAR_REFLECTION || lobe == LOBE_METAL_REFLECTION)
   {
-    brdf_ggx_smith_sample(data, mat, LOBE_SPECULAR_REFLECTION, mat.specularColor);
+    const BsdfLobeFresnel f = bsdfLobeFresnel(mat, lobe, dot(data.k1, mat.N), tint);
+    brdf_ggx_smith_sample(data, mat, lobe, f.tint, f.fresnel, f.eta);
   }
   else if(lobe == LOBE_SPECULAR_TRANSMISSION)
   {
-    // `transmissionTint` is float3(1) for plain glTF materials; see PbrMaterial.
-    btdf_ggx_smith_sample(data, mat, tint * mat.transmissionTint);
-  }
-  else if(lobe == LOBE_METAL_REFLECTION)
-  {
-    brdf_ggx_smith_sample(data, mat, LOBE_METAL_REFLECTION, mat.baseColor);
+    const BsdfLobeFresnel f = bsdfLobeFresnel(mat, lobe, dot(data.k1, mat.N), tint);
+    btdf_ggx_smith_sample(data, mat, f.tint, f.reflected);
   }
   else if(lobe == LOBE_CLEARCOAT_REFLECTION)
   {
-    brdf_ggx_smith_sample(data, bsdfClearcoatMaterial(mat), LOBE_CLEARCOAT_REFLECTION, float3(1.0f));
+    const BsdfLobeFresnel f = bsdfLobeFresnel(mat, lobe, dot(data.k1, mat.N), tint);
+    brdf_ggx_smith_sample(data, bsdfClearcoatMaterial(mat), LOBE_CLEARCOAT_REFLECTION, f.tint, f.fresnel, f.eta);
   }
   else if(lobe == LOBE_SHEEN_REFLECTION)
   {
