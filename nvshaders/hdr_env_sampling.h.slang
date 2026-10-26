@@ -21,6 +21,7 @@
 #define HDR_ENV_SAMPLING_GLSL 1
 
 
+#include "functions.h.slang"  // getSphericalUv
 #include "hdr_io.h.slang"
 
 /*-------------------------------------------------------------------------------------------------
@@ -71,20 +72,30 @@ float2 environmentSampleCoords(in StructuredBuffer<EnvAccel> envSamplingData, in
     xi.y    = (xi.y - sample_data.q) / (1.0f - sample_data.q);
   }
 
+  return environmentCellCoords(env_idx, xi.yz, width, height, toLight);
+}
+
+/*-------------------------------------------------------------------------------------------------
+# Function `environmentCellCoords`
+> A direction uniform in solid angle within grid cell `cellIdx`, from two uniforms `xi`, and the UV
+> to look it up at: the part of the alias method that follows the pick of the cell.
+-------------------------------------------------------------------------------------------------*/
+float2 environmentCellCoords(uint cellIdx, float2 xi, uint width, uint height, out float3 toLight)
+{
   // Compute the 2D integer coordinates of the texel
-  const uint px = env_idx % width;
-  uint       py = env_idx / width;
+  const uint px = cellIdx % width;
+  uint       py = cellIdx / width;
 
   // Uniformly sample the solid angle subtended by the pixel.
   // Generate both the UV for texture lookup and a direction in spherical coordinates
-  const float u       = float(px + xi.y) / float(width);
+  const float u       = float(px + xi.x) / float(width);
   const float phi     = u * (2.0f * M_PI) - M_PI;
   float       sin_phi = sin(phi);
   float       cos_phi = cos(phi);
 
   const float step_theta = M_PI / float(height);
   const float theta0     = float(py) * step_theta;
-  const float cos_theta  = cos(theta0) * (1.0f - xi.z) + cos(theta0 + step_theta) * xi.z;
+  const float cos_theta  = cos(theta0) * (1.0f - xi.y) + cos(theta0 + step_theta) * xi.y;
   const float theta      = acos(cos_theta);
   const float sin_theta  = sin(theta);
   const float v          = theta * M_1_OVER_PI;
@@ -158,5 +169,54 @@ float4 environmentSample(in Texture2D                 hdrTexture,
   return environmentSample(hdrTexture, hdrSampler, envSamplingData, tsize, randVal, toLight);
 }
 
+/*-------------------------------------------------------------------------------------------------
+# Function `environmentSampleCompensated`
+> A direction from the MIS-compensated table (`EnvCompensatedCell`, `nvvk::buildCompensatedEnvAliasmap`):
+> for a light sample that a BSDF sample of the same point is weighed against.
+
+Returns the radiance looked up as `environmentSample` does (bilinear), and sets `toLight` and `pdf`,
+the cell's solid-angle pdf under this table.
+-------------------------------------------------------------------------------------------------*/
+float3 environmentSampleCompensated(in Sampler2D                           hdrTexture,
+                                    in StructuredBuffer<EnvCompensatedCell> cells,
+                                    in uint2                                samplingGrid,
+                                    in float3                               randVal,
+                                    out float3                              toLight,
+                                    out float                               pdf)
+{
+  const uint size = samplingGrid.x * samplingGrid.y;
+  const uint idx  = min(uint(randVal.x * float(size)), size - 1U);
+
+  const EnvCompensatedCell entry = cells[idx];
+  uint                     cell;
+  float                    xiY = randVal.y;
+  if(xiY < entry.q)
+  {
+    cell = idx;
+    xiY /= entry.q;
+  }
+  else
+  {
+    cell = entry.alias;
+    xiY  = (xiY - entry.q) / (1.0f - entry.q);
+  }
+
+  const float2 uv = environmentCellCoords(cell, float2(xiY, randVal.z), samplingGrid.x, samplingGrid.y, toLight);
+  pdf             = cells[cell].pdf;
+  return hdrTexture.SampleLevel(uv, 0.0f).rgb;
+}
+
+/*-------------------------------------------------------------------------------------------------
+# Function `environmentCompensatedPdf`
+> The solid-angle pdf with which `environmentSampleCompensated` produces direction `dir` (in the
+> environment's frame, as for a lat-long lookup): its cell's.
+-------------------------------------------------------------------------------------------------*/
+float environmentCompensatedPdf(in StructuredBuffer<EnvCompensatedCell> cells, in uint2 samplingGrid, in float3 dir)
+{
+  const float2 uv = getSphericalUv(dir);
+  const uint   px = min(uint(max(uv.x, 0.0f) * float(samplingGrid.x)), samplingGrid.x - 1U);
+  const uint   py = min(uint(max(uv.y, 0.0f) * float(samplingGrid.y)), samplingGrid.y - 1U);
+  return cells[py * samplingGrid.x + px].pdf;
+}
 
 #endif  // ENV_SAMPLING_GLSL

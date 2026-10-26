@@ -36,6 +36,19 @@ struct EnvAccel
   float q;
 };
 
+// The environment's distribution for light samples a BSDF sample is weighed against (MIS
+// compensation, Karlik et al. 2019, Unreal's PathTracingSkylightMISCompensation): each cell in
+// proportion to how far its radiance rises above the environment's mean, so light samples go to
+// what BSDF sampling finds poorly and leave the even rest to it. One per sampling-grid cell: the
+// alias method's entry, as EnvAccel, and the solid-angle pdf of a direction in this cell.
+struct EnvCompensatedCell
+{
+  uint  alias;
+  float q;
+  float pdf;
+  float _pad;
+};
+
 struct HdrPushBlock
 {
   float4x4 mvp;
@@ -54,8 +67,9 @@ struct HdrDomePushConstant
 
 enum EnvBindings
 {
-  eHdr        = 0,
-  eImpSamples = 1
+  eHdr                   = 0,
+  eImpSamples            = 1,
+  eImpSamplesCompensated = 2,  // EnvCompensatedCell per sampling-grid cell
 };
 
 enum EnvDomeBindings

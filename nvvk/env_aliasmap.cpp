@@ -24,6 +24,9 @@
 
 #include "env_aliasmap.hpp"
 
+#include <algorithm>
+#include <cassert>
+#include <cmath>
 #include <memory>
 #include <numeric>
 
@@ -101,6 +104,50 @@ float buildEnvAliasmap(std::span<const float> data, std::span<shaderio::EnvAccel
   // Return the integral of the emitted radiance. The caller uses it to normalise the PDF of
   // each texel.
   return sum;
+}
+
+float buildCompensatedEnvAliasmap(std::span<const float> importance, uint32_t width, uint32_t height, std::span<shaderio::EnvCompensatedCell> cells)
+{
+  const size_t size = importance.size();
+  assert(size == size_t(width) * height && cells.size() == size);
+
+  // The solid angle of each row's cells: the sampler's own (hdr_env_sampling.h.slang), uniform in
+  // theta and phi
+  const double       stepTheta = 3.14159265358979323846 / height;
+  const double       stepPhi   = 2.0 * 3.14159265358979323846 / width;
+  std::vector<float> solidAngle(height);
+  for(uint32_t y = 0; y < height; ++y)
+    solidAngle[y] = float((std::cos(y * stepTheta) - std::cos((y + 1) * stepTheta)) * stepPhi);
+
+  double total = 0.0;
+  for(float v : importance)
+    total += v;
+  const float mean = float(total / (4.0 * 3.14159265358979323846));  // radiance, averaged over the sphere
+
+  std::vector<float> compensated(size);
+  double             compensatedTotal = 0.0;
+  for(size_t i = 0; i < size; ++i)
+  {
+    const float area = solidAngle[i / width];
+    const float L    = area > 0.0F ? importance[i] / area : 0.0F;
+    compensated[i]   = std::max(L - mean, 0.0F) * area;
+    compensatedTotal += compensated[i];
+  }
+  std::span<const float> weights = compensated;
+  if(!(compensatedTotal > kCompensationFloor * total))
+    weights = importance;
+
+  std::vector<shaderio::EnvAccel> accel(size);
+  const float                     integral = buildEnvAliasmap(weights, accel);
+  for(size_t i = 0; i < size; ++i)
+  {
+    const float area = solidAngle[i / width];
+    cells[i]         = {.alias = accel[i].alias,
+                        .q     = accel[i].q,
+                        .pdf   = area > 0.0F ? weights[i] / (integral * area) : 0.0F,
+                        ._pad  = 0.0F};
+  }
+  return integral;
 }
 
 }  // namespace nvvk

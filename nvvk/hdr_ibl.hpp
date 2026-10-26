@@ -137,6 +137,8 @@ public:
   float              getAverage() const { return m_average; }
   bool               isValid() const { return m_valid; }
   const nvvk::Buffer getEnvAccel() const { return m_accelImpSmpl; }
+  // The MIS-compensated table (buildCompensatedEnvAliasmap), bound at `eImpSamplesCompensated`
+  const nvvk::Buffer getEnvAccelCompensated() const { return m_accelCompensated; }
 
   // HDR + importance sampling
   inline VkDescriptorSetLayout getDescriptorSetLayout() const { return m_descPack.getLayout(); }
@@ -162,6 +164,7 @@ private:
   // Resources
   nvvk::Image          m_texHdr;
   nvvk::Buffer         m_accelImpSmpl;
+  nvvk::Buffer         m_accelCompensated;
   nvvk::DescriptorPack m_descPack;
   // True when m_texHdr was allocated by loadEnvironment() and this class owns it; false when
   // updateFromGpuImage() has bound an externally owned image into the descriptor set instead.
@@ -174,9 +177,9 @@ private:
   nvvk::DescriptorPack m_writePdfPack;
 
   void createDescriptorSetLayout();
-  // Rewrite `m_descPack.getSet(0)` so `eHdr` samples from `envImage` and `eImpSamples` reads
-  // from `aliasBuf`. Called by both loadEnvironment (owned image + alias) and
-  // updateFromGpuImage (external image + regenerated alias).
+  // Rewrite `m_descPack.getSet(0)` so `eHdr` samples from `envImage`, `eImpSamples` reads
+  // from `aliasBuf` and `eImpSamplesCompensated` from m_accelCompensated. Called by both
+  // loadEnvironment (owned image + alias) and updateFromGpuImage (external image + regenerated alias).
   void writeDescriptorSet(const nvvk::Image& envImage, const nvvk::Buffer& aliasBuf);
 };
 

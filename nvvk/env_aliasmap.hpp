@@ -31,6 +31,7 @@
 // `HdrIbl::updateFromGpuImage` (GPU-image path), so any test that pins this function also
 // pins both producer flows.
 
+#include <cstdint>
 #include <span>
 #include <vector>
 
@@ -51,5 +52,15 @@ namespace nvvk {
 // `accel` is written before it is read, so it does not need to be zero-initialised; and it is
 // read back during the build, so it must not be write-combined memory.
 float buildEnvAliasmap(std::span<const float> importance, std::span<shaderio::EnvAccel> accel);
+
+// The MIS-compensated table (shaderio::EnvCompensatedCell) over the same cells, which are a
+// `width` x `height` lat-long grid, row 0 at the top. A cell's radiance is its importance over its
+// solid angle; the table picks cells in proportion to max(radiance - mean, 0) times solid angle, the
+// mean over the whole sphere, and each entry's `pdf` is the solid-angle pdf of a direction in it.
+// An environment within `kCompensationFloor` of uniform, whose compensated integral is that small
+// a share of the full one, keeps the full distribution: light samples would otherwise find
+// nothing to sample. Returns the compensated integral (the full one when it falls back).
+inline constexpr float kCompensationFloor = 1e-3F;
+float buildCompensatedEnvAliasmap(std::span<const float> importance, uint32_t width, uint32_t height, std::span<shaderio::EnvCompensatedCell> cells);
 
 }  // namespace nvvk

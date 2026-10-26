@@ -55,7 +55,12 @@
 namespace nvvk {
 // Forward declaration -- definition lives at the bottom of the file. Kept as a forward decl so
 // the members of HdrIbl that call it below don't need to know its full body up here.
-std::vector<shaderio::EnvAccel> createEnvironmentAccel(float*& pixels, const uint32_t& width, const uint32_t& height, float& average, float& integral);
+std::vector<shaderio::EnvAccel> createEnvironmentAccel(float*&                                    pixels,
+                                                       const uint32_t&                            width,
+                                                       const uint32_t&                            height,
+                                                       float&                                     average,
+                                                       float&                                     integral,
+                                                       std::vector<shaderio::EnvCompensatedCell>& compensated);
 
 
 //--------------------------------------------------------------------------------------------------
@@ -195,12 +200,16 @@ void HdrIbl::loadEnvironment(VkCommandBuffer cmd, nvvk::CmdUploaderInterface& st
       nvutils::ScopedTimer st("Generating Acceleration structure");
       {
         // Creating the importance sampling for the HDR and storing the info in the m_accelImpSmpl buffer
-        std::vector<shaderio::EnvAccel> envAccel =
-            createEnvironmentAccel(pixels, imgSize.width, imgSize.height, m_average, m_integral);
+        std::vector<shaderio::EnvCompensatedCell> compensated;
+        std::vector<shaderio::EnvAccel>           envAccel =
+            createEnvironmentAccel(pixels, imgSize.width, imgSize.height, m_average, m_integral, compensated);
 
         NVVK_CHECK(m_alloc->createBuffer(m_accelImpSmpl, std::span(envAccel).size_bytes(), VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT));
         NVVK_CHECK(staging.appendBuffer(m_accelImpSmpl, 0, std::span(envAccel)));
         NVVK_DBG_NAME(m_accelImpSmpl.buffer);
+        NVVK_CHECK(m_alloc->createBuffer(m_accelCompensated, std::span(compensated).size_bytes(), VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT));
+        NVVK_CHECK(staging.appendBuffer(m_accelCompensated, 0, std::span(compensated)));
+        NVVK_DBG_NAME(m_accelCompensated.buffer);
 
         NVVK_CHECK(m_alloc->createImage(m_texHdr, imageInfo, DEFAULT_VkImageViewCreateInfo));
         NVVK_CHECK(staging.appendImage(m_texHdr, std::span(pixels, buffer_size / sizeof(float)), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
@@ -230,6 +239,11 @@ void HdrIbl::loadEnvironment(VkCommandBuffer cmd, nvvk::CmdUploaderInterface& st
     NVVK_CHECK(m_alloc->createBuffer(m_accelImpSmpl, std::span(accel).size_bytes(), VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT));
     NVVK_CHECK(staging.appendBuffer(m_accelImpSmpl, 0, std::span(accel)));
     NVVK_DBG_NAME(m_accelImpSmpl.buffer);
+    // Its compensated twin: the same one cell, with the pdf the dummy's alpha (1) gives the full one
+    std::vector<shaderio::EnvCompensatedCell> compensated{{.alias = 0, .q = 1.0F, .pdf = 1.0F, ._pad = 0.0F}};
+    NVVK_CHECK(m_alloc->createBuffer(m_accelCompensated, std::span(compensated).size_bytes(), VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT));
+    NVVK_CHECK(staging.appendBuffer(m_accelCompensated, 0, std::span(compensated)));
+    NVVK_DBG_NAME(m_accelCompensated.buffer);
   }
 
   // Sampler for the HDR
@@ -271,6 +285,7 @@ void HdrIbl::destroyEnvironment()
     m_texHdr          = {};
     m_hdrImageIsOwned = false;
     m_alloc->destroyBuffer(m_accelImpSmpl);
+    m_alloc->destroyBuffer(m_accelCompensated);
   }
 }
 
@@ -283,6 +298,7 @@ void HdrIbl::createDescriptorSetLayout()
   nvvk::DescriptorBindings bindings;
   bindings.addBinding(shaderio::EnvBindings::eHdr, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_ALL);  // HDR image
   bindings.addBinding(shaderio::EnvBindings::eImpSamples, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL);  // importance sampling
+  bindings.addBinding(shaderio::EnvBindings::eImpSamplesCompensated, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL);  // the same, for MIS
   NVVK_CHECK(m_descPack.init(bindings, m_device, 1));
   NVVK_DBG_NAME(m_descPack.getLayout());
   NVVK_DBG_NAME(m_descPack.getPool());
@@ -300,10 +316,12 @@ void HdrIbl::writeDescriptorSet(const nvvk::Image& envImage, const nvvk::Buffer&
   nvvk::DescriptorBindings bindings;
   bindings.addBinding(shaderio::EnvBindings::eHdr, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_ALL);
   bindings.addBinding(shaderio::EnvBindings::eImpSamples, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL);
+  bindings.addBinding(shaderio::EnvBindings::eImpSamplesCompensated, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL);
 
   nvvk::WriteSetContainer writeContainer;
   writeContainer.append(bindings.getWriteSet(shaderio::EnvBindings::eHdr, m_descPack.getSet(0)), envImage);
   writeContainer.append(bindings.getWriteSet(shaderio::EnvBindings::eImpSamples, m_descPack.getSet(0)), aliasBuf);
+  writeContainer.append(bindings.getWriteSet(shaderio::EnvBindings::eImpSamplesCompensated, m_descPack.getSet(0)), m_accelCompensated);
   vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writeContainer.size()), writeContainer.data(), 0, nullptr);
 }
 
@@ -473,6 +491,8 @@ void HdrIbl::updateFromGpuImage(const nvvk::QueueInfo& queueInfo,
   // write-combined.
   std::unique_ptr<shaderio::EnvAccel[]> envAccel = std::make_unique_for_overwrite<shaderio::EnvAccel[]>(cellCount);
   m_integral                                     = buildEnvAliasmap(importance, std::span(envAccel.get(), cellCount));
+  std::vector<shaderio::EnvCompensatedCell> compensated(cellCount);
+  buildCompensatedEnvAliasmap(importance, samplingGrid.width, samplingGrid.height, compensated);
   m_alloc->destroyBuffer(stagingReadback);
   if(m_integral == 0.0f)
   {
@@ -503,6 +523,14 @@ void HdrIbl::updateFromGpuImage(const nvvk::QueueInfo& queueInfo,
   // cache. autoFlushBuffer is a no-op on the coherent memory VMA typically picks for
   // AUTO + HOST_ACCESS_SEQUENTIAL_WRITE on desktop with ReBAR.
   m_alloc->autoFlushBuffer(m_accelImpSmpl);
+
+  // The compensated table beside it, the same way
+  const VkDeviceSize compensatedBytes = std::span(compensated).size_bytes();
+  NVVK_CHECK(m_alloc->createBuffer(m_accelCompensated, compensatedBytes, VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO,
+                                   VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT));
+  NVVK_DBG_NAME(m_accelCompensated.buffer);
+  std::memcpy(m_accelCompensated.mapping, compensated.data(), compensatedBytes);
+  m_alloc->autoFlushBuffer(m_accelCompensated);
 
   // -- Step 5: dispatch env_write_pdf ------------------------------------------------------
   // The caller must have transitioned latlongImage to VK_IMAGE_LAYOUT_GENERAL (a bake writes it
@@ -603,11 +631,13 @@ inline static float luminance(const float* color)
 // See:  https://arxiv.org/pdf/1901.05423.pdf
 // And store the PDF into the ALPHA channel of pixels
 //
-inline std::vector<shaderio::EnvAccel> createEnvironmentAccel(float*&         pixels,
-                                                              const uint32_t& width,
-                                                              const uint32_t& height,
-                                                              float&          average,
-                                                              float&          integral)
+// `compensated` gets the MIS-compensated table over the same texels (buildCompensatedEnvAliasmap).
+inline std::vector<shaderio::EnvAccel> createEnvironmentAccel(float*&                                    pixels,
+                                                              const uint32_t&                            width,
+                                                              const uint32_t&                            height,
+                                                              float&                                     average,
+                                                              float&                                     integral,
+                                                              std::vector<shaderio::EnvCompensatedCell>& compensated)
 {
   const uint32_t rx = width;
   const uint32_t ry = height;
@@ -648,6 +678,8 @@ inline std::vector<shaderio::EnvAccel> createEnvironmentAccel(float*&         pi
   // each smaller radiance texel will be assigned an "alias" with higher emitted radiance
   // As a byproduct this function also returns the integral of the radiance emitted by the environment
   integral = buildEnvAliasmap(importance_data, env_accel);
+  compensated.resize(size_t(rx) * ry);
+  buildCompensatedEnvAliasmap(importance_data, rx, ry, compensated);
   if(integral == 0.0f)
   {
     integral = 1.0f;
