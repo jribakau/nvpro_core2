@@ -365,6 +365,10 @@ void _evalKhronosIBLFillCommon(PbrMaterial mat,
   }
 }
 
+// `diffuseOcclusion` scales the diffuse and sheen lobes, `specularOcclusion` the specular and
+// clearcoat ones (Figure Viewer: ambient occlusion per lobe, as Unreal's AOMultiBounce and
+// GetSpecularOcclusion apply it). 1 leaves the IBL as it was; the material's occlusion map is then the
+// caller's to multiply in, as before.
 float3 evalKhronosIBL(PbrMaterial mat,
                       float3      V,
                       SamplerCube diffuseEnv,
@@ -375,7 +379,9 @@ float3 evalKhronosIBL(PbrMaterial mat,
                       float       envIntensity,
                       float       diffuseTransmissionThickness,
                       float3      transmissionRadiance,
-                      bool        haveTransmissionSample)
+                      bool        haveTransmissionSample,
+                      float3      diffuseOcclusion  = float3(1.0F),
+                      float       specularOcclusion = 1.0F)
 {
   IBLLobes lobes;
   _evalKhronosIBLFillCommon(mat, V, diffuseEnv, glossyEnv, ggxLut, envRotation, envIntensity,
@@ -383,6 +389,11 @@ float3 evalKhronosIBL(PbrMaterial mat,
   lobes.f_sheen = (max3(mat.sheenColor) > 0.0F) ?
                       getIBLCharlie(diffuseEnv, sheenLut, mat.N, V, mat.sheenRoughness, mat.sheenColor, envRotation, envIntensity) :
                       float3(0.0F);
+  lobes.f_diffuse *= diffuseOcclusion;
+  lobes.f_sheen *= diffuseOcclusion;
+  lobes.f_metal_specular *= specularOcclusion;
+  lobes.f_dielectric_specular *= specularOcclusion;
+  lobes.f_clearcoat *= specularOcclusion;
   return composeIBLAnalyticKhronos(mat, lobes, V, sheenLut);
 }
 
@@ -397,10 +408,13 @@ float3 evalKhronosIBL(PbrMaterial mat,
                       float       envIntensity,
                       float       diffuseTransmissionThickness,
                       float3      transmissionRadiance,
-                      bool        haveTransmissionSample)
+                      bool        haveTransmissionSample,
+                      float3      diffuseOcclusion  = float3(1.0F),
+                      float       specularOcclusion = 1.0F)
 {
   return evalKhronosIBL(mat, V, diffuseEnv, glossyEnv, ggxLut, sheenLut, quatFromYaw(envRotation), envIntensity,
-                        diffuseTransmissionThickness, transmissionRadiance, haveTransmissionSample);
+                        diffuseTransmissionThickness, transmissionRadiance, haveTransmissionSample, diffuseOcclusion,
+                        specularOcclusion);
 }
 
 /*-------------------------------------------------------------------------------------------------
