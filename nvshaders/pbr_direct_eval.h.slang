@@ -99,14 +99,25 @@ float3 BRDF_specularSheen(float3 sheenColor, float sheenRoughness, float NdotL, 
   return sheenColor * D * V;
 }
 
+// The GGX alpha that spreads a lobe of `alpha` over a sphere light (or the sun's disc) whose
+// angular radius has sine `sinA`, at the half vector's VdotH: Karis' widening as Unreal writes it
+// (ShadingModels.ush, New_a2). Only the lobe widens; D stays normalised, so the highlight keeps its
+// energy and is not dimmed a second time. 0: a point light, the lobe as it is.
+float sphereLightAlpha(float alpha, float sinA, float VdotH)
+{
+  if(sinA <= 0.0F)
+    return alpha;
+  return min(sqrt(alpha * alpha + 0.25F * sinA * (3.0F * alpha + sinA) / (VdotH + 0.001F)), 1.0F);
+}
+
 // Clearcoat radiance: GGX-Smith on the clearcoat normal, no Fresnel (caller multiplies by
-// clearcoatFresnel during the layered composite).
-float3 getPunctualRadianceClearCoat(float3 clearcoatNormal, float3 V, float3 L, float3 H, float clearcoatRoughness)
+// clearcoatFresnel during the layered composite). `lightSinAlpha`: as sphereLightAlpha's.
+float3 getPunctualRadianceClearCoat(float3 clearcoatNormal, float3 V, float3 L, float3 H, float clearcoatRoughness, float lightSinAlpha = 0.0F)
 {
   float NdotL = clampedDot(clearcoatNormal, L);
   float NdotV = clampedDot(clearcoatNormal, V);
   float NdotH = clampedDot(clearcoatNormal, H);
-  float aR    = clearcoatRoughness * clearcoatRoughness;
+  float aR    = sphereLightAlpha(clearcoatRoughness * clearcoatRoughness, lightSinAlpha, clampedDot(V, H));
   return float3(NdotL * V_GGX(NdotL, NdotV, aR) * D_GGX(NdotH, aR));
 }
 
@@ -156,7 +167,8 @@ float3 _bsdfEvaluatePunctualKhronosCore(PbrMaterial mat,
                                         float3      transmissionRay,
                                         float       diffuseTransmissionThickness,
                                         float       sheenScale,
-                                        float3      l_sheen)
+                                        float3      l_sheen,
+                                        float       lightSinAlpha = 0.0F)
 {
   float3 N     = mat.N;
   float3 L     = normalize(pointToLight);
@@ -248,10 +260,13 @@ float3 _bsdfEvaluatePunctualKhronosCore(PbrMaterial mat,
   }
 
   // ----- Specular reflection (metal + dielectric, isotropic or anisotropic) -----
+  // A light with a size spreads the highlight over it (sphereLightAlpha)
   float3 l_specular =
       isAnisotropic ?
-          lightIntensity * NdotL * BRDF_specularGGXAnisotropy(mat.roughness.x, mat.roughness.y, N, V, L, H, mat.T, mat.B) :
-          lightIntensity * NdotL * BRDF_specularGGX(alphaRoughness, NdotL, NdotV, NdotH);
+          lightIntensity * NdotL
+              * BRDF_specularGGXAnisotropy(sphereLightAlpha(mat.roughness.x, lightSinAlpha, VdotH),
+                                           sphereLightAlpha(mat.roughness.y, lightSinAlpha, VdotH), N, V, L, H, mat.T, mat.B) :
+          lightIntensity * NdotL * BRDF_specularGGX(sphereLightAlpha(alphaRoughness, lightSinAlpha, VdotH), NdotL, NdotV, NdotH);
 
   float3 l_metal_brdf      = metal_fresnel * l_specular;
   float3 l_dielectric_brdf = lerp(l_diffuse, l_specular, dielectric_fresnel);
@@ -266,7 +281,7 @@ float3 _bsdfEvaluatePunctualKhronosCore(PbrMaterial mat,
 
   // ----- Clearcoat reflection -----
   float3 l_clearcoat_brdf = (mat.clearcoat > 0.0F) ?
-                                lightIntensity * getPunctualRadianceClearCoat(mat.Nc, V, L, H, mat.clearcoatRoughness) :
+                                lightIntensity * getPunctualRadianceClearCoat(mat.Nc, V, L, H, mat.clearcoatRoughness, lightSinAlpha) :
                                 float3(0.0F);
 
   // ----- Layered composite (matches `pbr.frag:345-348`) -----
@@ -306,7 +321,8 @@ float3 bsdfEvaluatePunctualKhronos(PbrMaterial mat,
                                    float3      lightIntensity,
                                    float3      transmissionRay,
                                    float       diffuseTransmissionThickness,
-                                   Sampler2D   sheenLut)
+                                   Sampler2D   sheenLut,
+                                   float       lightSinAlpha = 0.0F)
 {
   // Sheen (KHR_materials_sheen): per-light Charlie radiance + bidirectional energy-compensation
   // scaling via the directional-albedo LUT (`min(LUT(NdotV), LUT(NdotL))`). The compiler is
@@ -330,7 +346,7 @@ float3 bsdfEvaluatePunctualKhronos(PbrMaterial mat,
   }
 
   return _bsdfEvaluatePunctualKhronosCore(mat, V, pointToLight, lightIntensity, transmissionRay,
-                                          diffuseTransmissionThickness, sheenScale, l_sheen);
+                                          diffuseTransmissionThickness, sheenScale, l_sheen, lightSinAlpha);
 }
 
 /*-------------------------------------------------------------------------------------------------
@@ -341,11 +357,11 @@ Use when the scene guarantees no material carries `KHR_materials_sheen`. Avoids 
 bake/bind the Charlie sheen LUT. If called on a material that DOES have sheen set, the sheen
 contribution is silently dropped -- by design; the caller is asserting the scene has no sheen.
 -------------------------------------------------------------------------------------------------*/
-float3 bsdfEvaluatePunctualKhronos(PbrMaterial mat, float3 V, float3 pointToLight, float3 lightIntensity, float3 transmissionRay, float diffuseTransmissionThickness)
+float3 bsdfEvaluatePunctualKhronos(PbrMaterial mat, float3 V, float3 pointToLight, float3 lightIntensity, float3 transmissionRay, float diffuseTransmissionThickness, float lightSinAlpha = 0.0F)
 {
   return _bsdfEvaluatePunctualKhronosCore(mat, V, pointToLight, lightIntensity, transmissionRay,
                                           diffuseTransmissionThickness, /*sheenScale=*/1.0F,
-                                          /*l_sheen=*/float3(0.0F));
+                                          /*l_sheen=*/float3(0.0F), lightSinAlpha);
 }
 
 #endif  // PBR_DIRECT_EVAL_H

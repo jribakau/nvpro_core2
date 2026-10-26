@@ -105,7 +105,9 @@ LightContrib singleLightContribution(in GltfLight light, in float3 surfacePos, i
 
   if(light.type == LightType::eLightTypeDirectional)
   {
-    if(dot(surfaceNormal, -light.direction) <= 0.0)
+    // A sun with a disc sets gradually: part of it still lights a surface whose horizon cuts it,
+    // down to where its far edge goes under (sin of its angular radius)
+    if(dot(surfaceNormal, -light.direction) <= -sin(0.5F * light.angularSizeOrInvRange))
       return contrib;
 
     contrib.incidentVector = light.direction;
