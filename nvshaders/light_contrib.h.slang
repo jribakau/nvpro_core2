@@ -149,10 +149,11 @@ LightContrib singleLightContribution(in GltfLight light, in float3 surfacePos, i
 
     if(light.radius > 0.0F)
     {
-      // More numerically stable version of 1 - cos(atan(min(light.radius * r_distance, 1.0F)));
-      float r              = min(light.radius * r_distance, 1.0F);
-      float r2p1           = fma(r, r, 1.F);
-      oneMinusCosHalfAngle = r * r / (r2p1 + sqrt(r2p1));
+      // The cone the sphere subtends, sin = radius / distance: 1 - cos without the cancellation.
+      // Its irradiance at normal incidence is then intensity / distance^2, as a point's. A point
+      // inside the sphere sees the hemisphere.
+      float sin2           = min(square(light.radius * r_distance), 1.0F);
+      oneMinusCosHalfAngle = sin2 / (1.0F + sqrt(1.0F - sin2));
 
       float solidAngleOverPi = 2.f * oneMinusCosHalfAngle;
 
