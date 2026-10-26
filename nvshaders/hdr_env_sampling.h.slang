@@ -207,6 +207,61 @@ float3 environmentSampleCompensated(in Sampler2D                           hdrTe
 }
 
 /*-------------------------------------------------------------------------------------------------
+# Function `environmentSampleCompensatedStratified`
+> `environmentSampleCompensated`'s distribution, by inverting the cumulative tables that follow it
+> (EnvCompensatedCell::cdf): randVal.x picks the row, randVal.y the cell in it, and what is left of
+> each places the direction in the cell. Monotonic in both, so a stratified point set (Sobol) stays
+> stratified over the environment -- a soft box's or the sky's light samples spread over it as the
+> points do -- where the alias method scatters neighbouring points. Binary searches: for the
+> frames that accumulate a still. randVal.z is not used.
+-------------------------------------------------------------------------------------------------*/
+float3 environmentSampleCompensatedStratified(in Sampler2D                           hdrTexture,
+                                              in StructuredBuffer<EnvCompensatedCell> cells,
+                                              in uint2                                samplingGrid,
+                                              in float3                               randVal,
+                                              out float3                              toLight,
+                                              out float                               pdf)
+{
+  const uint width = samplingGrid.x, height = samplingGrid.y;
+  const uint rows  = width * height;  // the row marginal starts here
+
+  // The first row whose marginal passes randVal.x
+  uint lo = 0, hi = height - 1U;
+  while(lo < hi)
+  {
+    const uint mid = (lo + hi) / 2U;
+    if(cells[rows + mid].cdf > randVal.x)
+      hi = mid;
+    else
+      lo = mid + 1U;
+  }
+  const uint  y      = lo;
+  const float rowLo  = (y > 0U) ? cells[rows + y - 1U].cdf : 0.0f;
+  const float rowHi  = cells[rows + y].cdf;
+  const float yRest  = saturate((randVal.x - rowLo) / max(rowHi - rowLo, 1e-30f));
+
+  // The first cell of that row whose conditional passes randVal.y
+  const uint first = y * width;
+  lo               = 0;
+  hi               = width - 1U;
+  while(lo < hi)
+  {
+    const uint mid = (lo + hi) / 2U;
+    if(cells[first + mid].cdf > randVal.y)
+      hi = mid;
+    else
+      lo = mid + 1U;
+  }
+  const uint  cell   = first + lo;
+  const float cellLo = (lo > 0U) ? cells[cell - 1U].cdf : 0.0f;
+  const float xRest  = saturate((randVal.y - cellLo) / max(cells[cell].cdf - cellLo, 1e-30f));
+
+  const float2 uv = environmentCellCoords(cell, float2(xRest, yRest), width, height, toLight);
+  pdf             = cells[cell].pdf;
+  return hdrTexture.SampleLevel(uv, 0.0f).rgb;
+}
+
+/*-------------------------------------------------------------------------------------------------
 # Function `environmentCompensatedPdf`
 > The solid-angle pdf with which `environmentSampleCompensated` produces direction `dir` (in the
 > environment's frame, as for a lat-long lookup): its cell's.

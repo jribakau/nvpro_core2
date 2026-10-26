@@ -60,7 +60,14 @@ float buildEnvAliasmap(std::span<const float> importance, std::span<shaderio::En
 // An environment within `kCompensationFloor` of uniform, whose compensated integral is that small
 // a share of the full one, keeps the full distribution: light samples would otherwise find
 // nothing to sample. Returns the compensated integral (the full one when it falls back).
+//
+// `cells` holds compensatedEnvTableSize(width, height) entries: the grid's, then the row marginal
+// (shaderio::EnvCompensatedCell::cdf).
 inline constexpr float kCompensationFloor = 1e-3F;
+inline size_t          compensatedEnvTableSize(uint32_t width, uint32_t height)
+{
+  return size_t(width) * height + height;
+}
 float buildCompensatedEnvAliasmap(std::span<const float> importance, uint32_t width, uint32_t height, std::span<shaderio::EnvCompensatedCell> cells);
 
 }  // namespace nvvk

@@ -109,7 +109,7 @@ float buildEnvAliasmap(std::span<const float> data, std::span<shaderio::EnvAccel
 float buildCompensatedEnvAliasmap(std::span<const float> importance, uint32_t width, uint32_t height, std::span<shaderio::EnvCompensatedCell> cells)
 {
   const size_t size = importance.size();
-  assert(size == size_t(width) * height && cells.size() == size);
+  assert(size == size_t(width) * height && cells.size() == compensatedEnvTableSize(width, height));
 
   // The solid angle of each row's cells: the sampler's own (hdr_env_sampling.h.slang), uniform in
   // theta and phi
@@ -145,7 +145,33 @@ float buildCompensatedEnvAliasmap(std::span<const float> importance, uint32_t wi
     cells[i]         = {.alias = accel[i].alias,
                         .q     = accel[i].q,
                         .pdf   = area > 0.0F ? weights[i] / (integral * area) : 0.0F,
-                        ._pad  = 0.0F};
+                        .cdf   = 0.0F};
+  }
+
+  // The cumulative tables of the same weights, summed in double so a cell a row's float would round
+  // away keeps its step: each row's conditional CDF, then the row marginal after the grid
+  double weightTotal = 0.0;
+  for(float w : weights)
+    weightTotal += w;
+  double rowsSoFar = 0.0;
+  for(uint32_t y = 0; y < height; ++y)
+  {
+    const size_t row    = size_t(y) * width;
+    double       rowSum = 0.0;
+    for(uint32_t x = 0; x < width; ++x)
+      rowSum += weights[row + x];
+    double running = 0.0;
+    for(uint32_t x = 0; x < width; ++x)
+    {
+      running += weights[row + x];
+      // A row of no weight is never picked; even steps keep its CDF well formed
+      cells[row + x].cdf = (x + 1 == width) ? 1.0F : float(rowSum > 0.0 ? running / rowSum : double(x + 1) / width);
+    }
+    rowsSoFar += rowSum;
+    cells[size + y] = {.alias = 0,
+                       .q     = 1.0F,
+                       .pdf   = 0.0F,
+                       .cdf   = (y + 1 == height) ? 1.0F : float(weightTotal > 0.0 ? rowsSoFar / weightTotal : double(y + 1) / height)};
   }
   return integral;
 }

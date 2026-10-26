@@ -41,12 +41,18 @@ struct EnvAccel
 // proportion to how far its radiance rises above the environment's mean, so light samples go to
 // what BSDF sampling finds poorly and leave the even rest to it. One per sampling-grid cell: the
 // alias method's entry, as EnvAccel, and the solid-angle pdf of a direction in this cell.
+//
+// The same distribution as cumulative tables, for a sampler whose points are stratified (Sobol): the
+// alias method sends neighbouring points to unrelated cells, inverting a CDF keeps them neighbours.
+// `cdf` is the row's conditional CDF at the cell's right edge; the grid's `width` x `height` cells
+// are followed by `height` entries whose `cdf` is the row marginal at each row's end (the rest of
+// those entries unused). environmentSampleCompensatedStratified inverts them.
 struct EnvCompensatedCell
 {
   uint  alias;
   float q;
   float pdf;
-  float _pad;
+  float cdf;
 };
 
 struct HdrPushBlock

@@ -239,8 +239,10 @@ void HdrIbl::loadEnvironment(VkCommandBuffer cmd, nvvk::CmdUploaderInterface& st
     NVVK_CHECK(m_alloc->createBuffer(m_accelImpSmpl, std::span(accel).size_bytes(), VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT));
     NVVK_CHECK(staging.appendBuffer(m_accelImpSmpl, 0, std::span(accel)));
     NVVK_DBG_NAME(m_accelImpSmpl.buffer);
-    // Its compensated twin: the same one cell, with the pdf the dummy's alpha (1) gives the full one
-    std::vector<shaderio::EnvCompensatedCell> compensated{{.alias = 0, .q = 1.0F, .pdf = 1.0F, ._pad = 0.0F}};
+    // Its compensated twin: the same one cell, with the pdf the dummy's alpha (1) gives the full one,
+    // and its one row's marginal
+    std::vector<shaderio::EnvCompensatedCell> compensated{{.alias = 0, .q = 1.0F, .pdf = 1.0F, .cdf = 1.0F},
+                                                          {.alias = 0, .q = 1.0F, .pdf = 0.0F, .cdf = 1.0F}};
     NVVK_CHECK(m_alloc->createBuffer(m_accelCompensated, std::span(compensated).size_bytes(), VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT));
     NVVK_CHECK(staging.appendBuffer(m_accelCompensated, 0, std::span(compensated)));
     NVVK_DBG_NAME(m_accelCompensated.buffer);
@@ -491,7 +493,7 @@ void HdrIbl::updateFromGpuImage(const nvvk::QueueInfo& queueInfo,
   // write-combined.
   std::unique_ptr<shaderio::EnvAccel[]> envAccel = std::make_unique_for_overwrite<shaderio::EnvAccel[]>(cellCount);
   m_integral                                     = buildEnvAliasmap(importance, std::span(envAccel.get(), cellCount));
-  std::vector<shaderio::EnvCompensatedCell> compensated(cellCount);
+  std::vector<shaderio::EnvCompensatedCell> compensated(compensatedEnvTableSize(samplingGrid.width, samplingGrid.height));
   buildCompensatedEnvAliasmap(importance, samplingGrid.width, samplingGrid.height, compensated);
   m_alloc->destroyBuffer(stagingReadback);
   if(m_integral == 0.0f)
@@ -678,7 +680,7 @@ inline std::vector<shaderio::EnvAccel> createEnvironmentAccel(float*&           
   // each smaller radiance texel will be assigned an "alias" with higher emitted radiance
   // As a byproduct this function also returns the integral of the radiance emitted by the environment
   integral = buildEnvAliasmap(importance_data, env_accel);
-  compensated.resize(size_t(rx) * ry);
+  compensated.resize(compensatedEnvTableSize(rx, ry));
   buildCompensatedEnvAliasmap(importance_data, rx, ry, compensated);
   if(integral == 0.0f)
   {
