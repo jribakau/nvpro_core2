@@ -157,6 +157,25 @@ float ggx_smith_shadow_mask(NVSHADERS_OUT_TYPE(float) G1, NVSHADERS_OUT_TYPE(flo
   return G1 * G2;
 }
 
+/*-------------------------------------------------------------------------------------------------
+# Function `ggx_smith_shadow_mask_correlated`
+> The height-correlated Smith shadowing-masking function, 1 / (1 + Lambda(k1) + Lambda(k2)).
+
+A microfacet hidden from one direction is likelier hidden from the other, so the joint term is
+larger than the product (Heitz 2014), most at grazing on rough surfaces. G1 and G2 are each
+direction's own masking, as `ggx_smith_shadow_mask` gives them; the VNDF pdf keeps G1. For
+reflection only: transmission's correlated form differs.
+-------------------------------------------------------------------------------------------------*/
+float ggx_smith_shadow_mask_correlated(NVSHADERS_OUT_TYPE(float) G1, NVSHADERS_OUT_TYPE(float) G2, const float3 k1, const float3 k2, const float2 roughness)
+{
+  G1 = smith_shadow_or_mask(k1, roughness);
+  G2 = smith_shadow_or_mask(k2, roughness);
+  if(G1 <= 0.0f || G2 <= 0.0f)
+    return 0.0f;
+  // 1 / G = 1 + Lambda
+  return 1.0f / (1.0f / G1 + 1.0f / G2 - 1.0f);
+}
+
 // Computes the squared norm of s/p polarized Fresnel reflection coefficients and phase shifts in complex unit circle.
 //
 // See Max Born and Emil Wolf, "Principles of Optics", section 13.4.1,

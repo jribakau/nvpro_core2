@@ -101,6 +101,7 @@ and a V-cavity shadowing-masking function).
 
 #include "functions.h.slang"           // cosineSampleHemisphere
 #include "pbr_ggx_microfacet.h.slang"  // brdfLambertian, ..
+#include "ggx_albedo_table.h.slang"
 #include "bsdf_types.h.slang"
 #include "pbr_material_types.h.slang"
 
@@ -290,25 +291,49 @@ float fresnelCosineApproximation(float VdotN, float roughness)
 #define BSDF_FRESNEL_SCHLICK 2     // Schlick's from the tint (a metal's base colour) to white at k1.h
 
 /*-------------------------------------------------------------------------------------------------
-# Function `ggxSchlickAlbedo`
-> The directional albedo of a GGX-Smith reflection lobe of roughness `alpha` with Schlick's Fresnel
-> from `f0` to 1, at view cosine `NoV`: f0 * scale + bias, by the fit of Ray Tracing Gems chapter 32
-> (as EnvBRDFApprox2).
+# Function `ggxAlbedoScaleBias`
+> The directional albedo of the GGX reflection lobe below (height-correlated Smith) of roughness
+> `alpha` at view cosine `NoV`, with Schlick's Fresnel from f0 to 1, as f0 * x + y: the baked table
+> (ggx_albedo_table.h.slang), bilinear in perceptual roughness and sqrt(NoV). The fit of Ray Tracing
+> Gems chapter 32 it replaces was the uncorrelated lobe's, and up to 0.27 off the correlated one at
+> grazing.
 -------------------------------------------------------------------------------------------------*/
+float2 ggxAlbedoScaleBias(float alpha, float NoV)
+{
+  const int   last = GGX_ALBEDO_TABLE_RES - 1;
+  const float x    = sqrt(clamp(alpha, 0.0F, 1.0F)) * float(last);
+  const float y    = sqrt(clamp(NoV, 0.0F, 1.0F)) * float(last);
+  const int   i    = min(int(x), last - 1);
+  const int   j    = min(int(y), last - 1);
+  const float fx   = x - float(i);
+  const float fy   = y - float(j);
+  const int   k    = i * GGX_ALBEDO_TABLE_RES + j;
+  const int   kx   = k + GGX_ALBEDO_TABLE_RES;  // the next roughness
+  const float s0   = GGX_ALBEDO_SCALE[k] + (GGX_ALBEDO_SCALE[kx] - GGX_ALBEDO_SCALE[k]) * fx;
+  const float s1   = GGX_ALBEDO_SCALE[k + 1] + (GGX_ALBEDO_SCALE[kx + 1] - GGX_ALBEDO_SCALE[k + 1]) * fx;
+  const float b0   = GGX_ALBEDO_BIAS[k] + (GGX_ALBEDO_BIAS[kx] - GGX_ALBEDO_BIAS[k]) * fx;
+  const float b1   = GGX_ALBEDO_BIAS[k + 1] + (GGX_ALBEDO_BIAS[kx + 1] - GGX_ALBEDO_BIAS[k + 1]) * fx;
+  return float2(s0 + (s1 - s0) * fy, b0 + (b1 - b0) * fy);
+}
+
+// The albedo itself, for one f0
 float ggxSchlickAlbedo(float f0, float alpha, float NoV)
 {
-  const float x      = clamp(NoV, 0.0F, 1.0F);
-  const float x2     = x * x;
-  const float x3     = x2 * x;
-  const float a      = clamp(alpha, 0.0F, 1.0F);
-  const float a3     = a * a * a;
-  const float biasN  = (0.99044F - 1.28514F * x) + a * (1.29678F - 0.755907F * x);
-  const float biasD  = (1.0F + 2.92338F * x + 59.4188F * x3) + a * (20.3225F - 27.0302F * x + 222.592F * x3)
-                      + a3 * (121.563F + 626.13F * x + 316.627F * x3);
-  const float scaleN = (0.0365463F + 3.32707F * x) + a * (9.0632F - 9.04756F * x);
-  const float scaleD = (1.0F + 3.59685F * x2 - 1.36772F * x3) + a * (9.04401F - 16.3174F * x2 + 9.22949F * x3)
-                       + a3 * (5.56589F + 19.7886F * x2 - 20.2123F * x3);
-  return clamp(f0 * max(scaleN / scaleD, 0.0F) + max(biasN / biasD, 0.0F), 0.0F, 1.0F);
+  const float2 sb = ggxAlbedoScaleBias(alpha, NoV);
+  return clamp(f0 * sb.x + sb.y, 0.0F, 1.0F);
+}
+
+/*-------------------------------------------------------------------------------------------------
+# Function `ggxMultiScatterFactor`
+> The light a GGX reflection lobe of Schlick's Fresnel from `f0` loses to single scattering, given
+> back: 1 + f0 (1 / E - 1), E its albedo with no Fresnel at `NoV` (Turquin 2019). The lobe keeps
+> its shape. A rough white metal reflects all the light again instead of 50-70% (alpha 1).
+-------------------------------------------------------------------------------------------------*/
+float3 ggxMultiScatterFactor(float3 f0, float alpha, float NoV)
+{
+  const float2 sb = ggxAlbedoScaleBias(alpha, NoV);
+  const float  e  = max(sb.x + sb.y, 0.05F);
+  return float3(1.0F) + f0 * (1.0F / e - 1.0F);
 }
 
 float dielectricF0(float eta)
@@ -701,7 +726,7 @@ float3 bsdfMicrofacetFresnel(int fresnel, float eta, float3 tint, float k1h)
   return tint;
 }
 
-// Evaluates a reflective lobe with a GGX NDF and an uncorrelated Smith
+// Evaluates a reflective lobe with a GGX NDF and a height-correlated Smith
 // scattering-masking function. `fresnel`, `eta`: how each microfacet's reflection is weighed.
 void brdf_ggx_smith_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat, const int lobe, float3 tint, int fresnel, float eta)
 {
@@ -744,14 +769,18 @@ void brdf_ggx_smith_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMateria
   float G2;
 
   float G12;
-  G12 = ggx_smith_shadow_mask(G1, G2, float3(dot(mat.T, data.k1), dot(mat.B, data.k1), nk1),
-                              float3(dot(mat.T, data.k2), dot(mat.B, data.k2), nk2), mat.roughness);
+  G12 = ggx_smith_shadow_mask_correlated(G1, G2, float3(dot(mat.T, data.k1), dot(mat.B, data.k1), nk1),
+                                         float3(dot(mat.T, data.k2), dot(mat.B, data.k2), nk2), mat.roughness);
 
   data.pdf *= 0.25f / (nk1 * nh);
 
   float3 bsdf = float3(G12 * data.pdf);
 
   data.pdf *= G1;
+
+  // A metal's lost multiple scattering, given back by its Fresnel's f0 (the base colour)
+  if(lobe == LOBE_METAL_REFLECTION && fresnel == BSDF_FRESNEL_SCHLICK)
+    bsdf *= ggxMultiScatterFactor(tint, 0.5f * (mat.roughness.x + mat.roughness.y), nk1);
 
   tint = bsdfMicrofacetFresnel(fresnel, eta, tint, k1h);
 
@@ -775,7 +804,7 @@ void brdf_ggx_smith_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMateria
   data.bsdf_glossy = bsdf * tint;
 }
 
-// Samples a reflective lobe with a GGX NDF and an uncorrelated Smith
+// Samples a reflective lobe with a GGX NDF and a height-correlated Smith
 // scattering-masking function. `fresnel`, `eta`: as brdf_ggx_smith_eval's.
 void brdf_ggx_smith_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat, const int lobe, float3 tint, int fresnel, float eta)
 {
@@ -829,7 +858,7 @@ void brdf_ggx_smith_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMateria
   float G1;
   float G2;
 
-  float G12 = ggx_smith_shadow_mask(G1, G2, k10, float3(dot(data.k2, mat.T), dot(data.k2, mat.B), nk2), mat.roughness);
+  float G12 = ggx_smith_shadow_mask_correlated(G1, G2, k10, float3(dot(data.k2, mat.T), dot(data.k2, mat.B), nk2), mat.roughness);
 
   if(G12 <= 0.0f)
   {
@@ -837,12 +866,16 @@ void brdf_ggx_smith_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMateria
     return;
   }
 
-  data.bsdf_over_pdf = float3(G2);
+  // The VNDF sample's pdf has G1: what is left of the joint masking
+  data.bsdf_over_pdf = float3(G12 / G1);
   data.event_type    = BSDF_EVENT_GLOSSY_REFLECTION;
 
   // Compute pdf
   data.pdf = hvd_ggx_eval(1.0f / mat.roughness, h0) * G1;
   data.pdf *= 0.25f / (nk1 * h0.z);
+
+  if(lobe == LOBE_METAL_REFLECTION && fresnel == BSDF_FRESNEL_SCHLICK)
+    data.bsdf_over_pdf *= ggxMultiScatterFactor(tint, 0.5f * (mat.roughness.x + mat.roughness.y), nk1);
 
   tint = bsdfMicrofacetFresnel(fresnel, eta, tint, kh);
 
