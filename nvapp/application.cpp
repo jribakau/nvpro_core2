@@ -966,6 +966,10 @@ void nvapp::Application::headlessRun()
 
     waitForFrameCompletion();
 
+    // Free resources from the frame that last used this ring slot, as the windowed loop does;
+    // without it every submitResourceFree() closure waited for shutdown
+    freeResourcesQueue();
+
     prepareFrameToSignal(getFrameCycleSize());
 
     VkCommandBuffer cmd = beginCommandRecording();  // Start the command buffer
