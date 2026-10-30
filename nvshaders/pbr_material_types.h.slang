@@ -180,4 +180,7 @@ float3 volumeExtinctionCoefficient(float3 attenuationColor, float attenuationDis
 {
   return -log(max(attenuationColor, float3(0.001))) / max(attenuationDistance, 1e-6);
 }
+
+// A medium scatters past this sigma_s: below it light crosses as through clear glass, no walk
+static const float VOLUME_MIN_SCATTER = 0.001f;
 #endif  // NVVKHL_PBR_MAT_STRUCT_H

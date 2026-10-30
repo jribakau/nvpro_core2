@@ -422,6 +422,23 @@ float3 bsdfCoatDarkening(float coat, float3 baseColor, float metallic, float tra
   return float3(1.0F) + (darkened - float3(1.0F)) * coat;
 }
 
+// What goes through a surface and doesn't come back to its coat: clear glass's light. A scattering medium
+// hands back what it doesn't absorb, as an opaque base does, so skin darkens the same on its walk as in the
+// thin preview, which has moved that transmission to diffuse.
+float bsdfCoatClearTransmission(PbrMaterial mat)
+{
+  return max(mat.scatterCoefficient.x, max(mat.scatterCoefficient.y, mat.scatterCoefficient.z)) > VOLUME_MIN_SCATTER ? 0.0F : mat.transmission;
+}
+
+// What a coat takes from the layers under it, seen from outside: one factor for all of them. From inside
+// the surface nothing is under the coat.
+float3 bsdfUnderCoat(PbrMaterial mat)
+{
+  if(mat.clearcoat <= 0.0F || mat.ior1 > 1.0F)
+    return float3(1.0F);
+  return bsdfCoatDarkening(mat.clearcoat, mat.baseColor, mat.metallic, bsdfCoatClearTransmission(mat), 0.5F * (mat.roughness.x + mat.roughness.y));
+}
+
 // How much of a surface's emission comes out through its coat at `VdotN`: emission lies under the coat,
 // so it loses what the coat reflects and what it gives back to the base. From the row's factors in a light
 // sample, which reads no textures but the emission's.
@@ -453,9 +470,7 @@ ARRAY_TYPE(float, LOBE_COUNT, ) computeLobeWeights(PbrMaterial mat, float VdotN,
   float frCoat = 0.0F;
   if(mat.clearcoat > 0.0f)
   {
-    // A coat, seen from outside
-    if(mat.ior1 <= 1.0F)
-      tint *= bsdfCoatDarkening(mat.clearcoat, tint, mat.metallic, mat.transmission, 0.5F * (mat.roughness.x + mat.roughness.y));
+    tint *= bsdfUnderCoat(mat);
     if(bsdfClearcoatFresnelInLobe(mat))
     {
       frCoat = bsdfClearcoatAlbedo(mat, VdotN);
@@ -1510,13 +1525,16 @@ void bsdfEvaluateLobe(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial m
   {
     // Per KHR_materials_diffuse_transmission, the BTDF color is `diffuseTransmissionColorFactor`,
     // independent of `baseColor`. Pass it directly (bypassing the iridescence-modified `tint`,
-    // which only applies to the dielectric base / specular layers).
-    brdf_diffuse_transmission_eval(data, mat, mat.diffuseTransmissionColorFactor);
+    // which only applies to the dielectric base / specular layers). A coat still darkens it.
+    brdf_diffuse_transmission_eval(data, mat, mat.diffuseTransmissionColorFactor * bsdfUnderCoat(mat));
   }
   else if(lobe == LOBE_SPECULAR_REFLECTION || lobe == LOBE_METAL_REFLECTION)
   {
     const BsdfLobeFresnel f = bsdfLobeFresnel(mat, lobe, dot(data.k1, mat.N), tint);
     brdf_ggx_smith_eval(data, mat, lobe, f.tint, f.fresnel, f.eta);
+    // A metal's tint is its Fresnel's f0, which a coat doesn't change; it darkens what the metal reflects
+    if(lobe == LOBE_METAL_REFLECTION)
+      data.bsdf_glossy *= bsdfUnderCoat(mat);
   }
   else if(lobe == LOBE_SPECULAR_TRANSMISSION)
   {
@@ -1720,12 +1738,14 @@ void bsdfSampleLobe(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat, 
   {
     // Per KHR_materials_diffuse_transmission, the BTDF color is `diffuseTransmissionColorFactor`,
     // independent of `baseColor`. Pass it directly; see brdf_diffuse_transmission_eval dispatch.
-    brdf_diffuse_transmission_sample(data, mat, mat.diffuseTransmissionColorFactor);
+    brdf_diffuse_transmission_sample(data, mat, mat.diffuseTransmissionColorFactor * bsdfUnderCoat(mat));
   }
   else if(lobe == LOBE_SPECULAR_REFLECTION || lobe == LOBE_METAL_REFLECTION)
   {
     const BsdfLobeFresnel f = bsdfLobeFresnel(mat, lobe, dot(data.k1, mat.N), tint);
     brdf_ggx_smith_sample(data, mat, lobe, f.tint, f.fresnel, f.eta);
+    if(lobe == LOBE_METAL_REFLECTION)
+      data.bsdf_over_pdf *= bsdfUnderCoat(mat);
   }
   else if(lobe == LOBE_SPECULAR_TRANSMISSION)
   {
