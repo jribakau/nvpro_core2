@@ -265,7 +265,8 @@ float henyeyGreensteinPdf(float cosTheta, float g)
 #define LOBE_SHEEN_REFLECTION 4
 #define LOBE_CLEARCOAT_REFLECTION 5
 #define LOBE_DIFFUSE_TRANSMISSION 6
-#define LOBE_COUNT 7
+#define LOBE_SPECULAR2_REFLECTION 7
+#define LOBE_COUNT 8
 
 // KHR_materials_retroreflection (MRM) excludes transmission, clearcoat, and sheen from the
 // mirrored-V blend -- only the base metal/dielectric specular lobes participate.
@@ -391,6 +392,13 @@ float bsdfClearcoatAlbedo(PbrMaterial mat, float VdotN)
   return clamp(mat.clearcoat * ggxDielectricAlbedo(1.5F / mat.ior1, alpha, VdotN), 0.0F, 1.0F);
 }
 
+// The second lobe's: the same index
+float bsdfSpecular2Albedo(PbrMaterial mat, float VdotN)
+{
+  const float alpha = mat.specular2Roughness * mat.specular2Roughness;
+  return clamp(mat.specular2 * ggxDielectricAlbedo(1.5F / mat.ior1, alpha, VdotN), 0.0F, 1.0F);
+}
+
 /*-------------------------------------------------------------------------------------------------
 # Function `bsdfCoatDarkening`
 > What a coat takes from the base under it, past what it reflects at the view: light the coat reflects
@@ -416,10 +424,10 @@ float3 bsdfCoatDarkening(float coat, float3 baseColor, float metallic, float tra
 
 // How much of a surface's emission comes out through its coat at `VdotN`: emission lies under the coat,
 // so it loses what the coat reflects and what it gives back to the base. From the row's factors in a light
-// sample, which reads no textures but the emission's. Not under DAZ's second lobe, which is no layer.
-float3 bsdfCoatEmission(float coat, float coatIsLobe, float coatRoughness, float3 baseColor, float metallic, float transmission, float roughness, float VdotN)
+// sample, which reads no textures but the emission's.
+float3 bsdfCoatEmission(float coat, float coatRoughness, float3 baseColor, float metallic, float transmission, float roughness, float VdotN)
 {
-  if(coat <= 0.0F || coatIsLobe > 0.0F)
+  if(coat <= 0.0F)
     return float3(1.0F);
   const float reflected = clamp(coat * ggxDielectricAlbedo(1.5F, coatRoughness * coatRoughness, VdotN), 0.0F, 1.0F);
   return (1.0F - reflected) * bsdfCoatDarkening(coat, baseColor, metallic, transmission, roughness);
@@ -445,8 +453,8 @@ ARRAY_TYPE(float, LOBE_COUNT, ) computeLobeWeights(PbrMaterial mat, float VdotN,
   float frCoat = 0.0F;
   if(mat.clearcoat > 0.0f)
   {
-    // A coat, seen from outside. The slot may hold DAZ's second specular lobe, which is no layer.
-    if(mat.clearcoatIsLobe <= 0.0F && mat.ior1 <= 1.0F)
+    // A coat, seen from outside
+    if(mat.ior1 <= 1.0F)
       tint *= bsdfCoatDarkening(mat.clearcoat, tint, mat.metallic, mat.transmission, 0.5F * (mat.roughness.x + mat.roughness.y));
     if(bsdfClearcoatFresnelInLobe(mat))
     {
@@ -456,6 +464,20 @@ ARRAY_TYPE(float, LOBE_COUNT, ) computeLobeWeights(PbrMaterial mat, float VdotN,
     {
       float frCosineClearcoat = fresnelCosineApproximation(VdotN, mat.clearcoatRoughness);
       frCoat                  = mat.clearcoat * ior_fresnel(1.5f / mat.ior1, frCosineClearcoat);
+    }
+  }
+
+  // The second lobe, under the coat and over everything else
+  float frSpecular2 = 0.0F;
+  if(mat.specular2 > 0.0F)
+  {
+    if(bsdfClearcoatFresnelInLobe(mat))
+    {
+      frSpecular2 = bsdfSpecular2Albedo(mat, VdotN);
+    }
+    else
+    {
+      frSpecular2 = mat.specular2 * ior_fresnel(1.5f / mat.ior1, fresnelCosineApproximation(VdotN, mat.specular2Roughness));
     }
   }
 
@@ -498,10 +520,11 @@ ARRAY_TYPE(float, LOBE_COUNT, ) computeLobeWeights(PbrMaterial mat, float VdotN,
   }
 
   /*
-  Our model consists of 6 layers. Each layer handles a fraction
+  Our model consists of 7 layers. Each layer handles a fraction
   of light that didn't hit any layers above it:
 
     - Clearcoat       : clearcoat * schlickFresnel(1.5, VdotN)
+    - Second specular : specular2 * schlickFresnel(1.5, VdotN)
     - Sheen           : sheen
     - Metal           : metallic
     - Specular        : specular * schlickFresnel(ior, VdotN)
@@ -511,6 +534,7 @@ ARRAY_TYPE(float, LOBE_COUNT, ) computeLobeWeights(PbrMaterial mat, float VdotN,
 
   ARRAY_TYPE(float, LOBE_COUNT, weightLobe);
   weightLobe[LOBE_CLEARCOAT_REFLECTION]  = 0;
+  weightLobe[LOBE_SPECULAR2_REFLECTION]  = 0;
   weightLobe[LOBE_SHEEN_REFLECTION]      = 0;
   weightLobe[LOBE_METAL_REFLECTION]      = 0;
   weightLobe[LOBE_SPECULAR_REFLECTION]   = 0;
@@ -522,6 +546,9 @@ ARRAY_TYPE(float, LOBE_COUNT, ) computeLobeWeights(PbrMaterial mat, float VdotN,
 
   weightLobe[LOBE_CLEARCOAT_REFLECTION] = frCoat;  // BRDF clearcoat reflection (GGX-Smith)
   weightBase *= 1.0f - frCoat;
+
+  weightLobe[LOBE_SPECULAR2_REFLECTION] = weightBase * frSpecular2;  // BRDF second specular (GGX-Smith)
+  weightBase *= 1.0f - frSpecular2;
 
   weightLobe[LOBE_SHEEN_REFLECTION] = weightBase * sheen;  // BRDF sheen reflection (Lambert)
   weightBase *= 1.0f - sheen;
@@ -1383,6 +1410,14 @@ PbrMaterial bsdfClearcoatMaterial(PbrMaterial mat)
   return mat;
 }
 
+// The second lobe's material: its roughness on the base's normal, no iridescence
+PbrMaterial bsdfSpecular2Material(PbrMaterial mat)
+{
+  mat.roughness   = float2(mat.specular2Roughness * mat.specular2Roughness);
+  mat.iridescence = 0.0f;
+  return mat;
+}
+
 /*-------------------------------------------------------------------------------------------------
 # Function `bsdfLobeFresnel`
 > How a reflection or transmission lobe carries its Fresnel, at view cosine `VdotN` (the one
@@ -1442,6 +1477,16 @@ BsdfLobeFresnel bsdfLobeFresnel(PbrMaterial mat, int lobe, float VdotN, float3 t
       f.eta     = 1.5F / mat.ior1;
     }
   }
+  else if(lobe == LOBE_SPECULAR2_REFLECTION)
+  {
+    f.tint = float3(1.0F);
+    if(bsdfClearcoatFresnelInLobe(mat))
+    {
+      f.tint    = float3(mat.specular2 / max(bsdfSpecular2Albedo(mat, VdotN), 1e-6F));
+      f.fresnel = BSDF_FRESNEL_DIELECTRIC;
+      f.eta     = 1.5F / mat.ior1;
+    }
+  }
   return f;
 }
 
@@ -1482,6 +1527,11 @@ void bsdfEvaluateLobe(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial m
   {
     const BsdfLobeFresnel f = bsdfLobeFresnel(mat, lobe, dot(data.k1, mat.N), tint);
     brdf_ggx_smith_eval(data, bsdfClearcoatMaterial(mat), LOBE_CLEARCOAT_REFLECTION, f.tint, f.fresnel, f.eta);
+  }
+  else if(lobe == LOBE_SPECULAR2_REFLECTION)
+  {
+    const BsdfLobeFresnel f = bsdfLobeFresnel(mat, lobe, dot(data.k1, mat.N), tint);
+    brdf_ggx_smith_eval(data, bsdfSpecular2Material(mat), LOBE_SPECULAR2_REFLECTION, f.tint, f.fresnel, f.eta);
   }
   else if(lobe == LOBE_SHEEN_REFLECTION)
   {
@@ -1618,6 +1668,7 @@ bool bsdfEvaluateSumWeighted(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMat
   acc.pdf          = 0.0f;
   bool covered     = true;
   covered = bsdfAccumulateLobe(acc, data, mat, LOBE_CLEARCOAT_REFLECTION, s[LOBE_CLEARCOAT_REFLECTION], tint, sampledLobe) && covered;
+  covered = bsdfAccumulateLobe(acc, data, mat, LOBE_SPECULAR2_REFLECTION, s[LOBE_SPECULAR2_REFLECTION], tint, sampledLobe) && covered;
   covered = bsdfAccumulateLobe(acc, data, mat, LOBE_SHEEN_REFLECTION, s[LOBE_SHEEN_REFLECTION], tint, sampledLobe) && covered;
   covered = bsdfAccumulateLobe(acc, data, mat, LOBE_METAL_REFLECTION, s[LOBE_METAL_REFLECTION], tint, sampledLobe) && covered;
   covered = bsdfAccumulateLobe(acc, data, mat, LOBE_SPECULAR_REFLECTION, s[LOBE_SPECULAR_REFLECTION], tint, sampledLobe) && covered;
@@ -1685,6 +1736,11 @@ void bsdfSampleLobe(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat, 
   {
     const BsdfLobeFresnel f = bsdfLobeFresnel(mat, lobe, dot(data.k1, mat.N), tint);
     brdf_ggx_smith_sample(data, bsdfClearcoatMaterial(mat), LOBE_CLEARCOAT_REFLECTION, f.tint, f.fresnel, f.eta);
+  }
+  else if(lobe == LOBE_SPECULAR2_REFLECTION)
+  {
+    const BsdfLobeFresnel f = bsdfLobeFresnel(mat, lobe, dot(data.k1, mat.N), tint);
+    brdf_ggx_smith_sample(data, bsdfSpecular2Material(mat), LOBE_SPECULAR2_REFLECTION, f.tint, f.fresnel, f.eta);
   }
   else if(lobe == LOBE_SHEEN_REFLECTION)
   {

@@ -70,7 +70,11 @@ struct PbrMaterial
   float  clearcoat;           // KHR_materials_clearcoat
   float  clearcoatRoughness;  //
   float3 Nc;                  // clearcoat normal
-  float  clearcoatIsLobe;     // 1: the clearcoat slot holds a second specular lobe, not a coat
+
+  // A second specular lobe under the coat, on the base's normal: DAZ's tight dual lobe, skin's wet
+  // highlight over its broad one. No layer: it darkens nothing.
+  float specular2;
+  float specular2Roughness;  // perceptual, as clearcoatRoughness
 
   float iridescence;  // KHR_materials_iridescence
   float iridescenceIor;
@@ -137,7 +141,8 @@ PbrMaterial defaultPbrMaterial()
   mat.diffuseTransmissionColorFactor = float3(1.0F);
 
   mat.retroreflection = 0.0F;
-  mat.clearcoatIsLobe = 0.0F;
+  mat.specular2          = 0.0F;
+  mat.specular2Roughness = 0.01F;
 
   return mat;
 }
