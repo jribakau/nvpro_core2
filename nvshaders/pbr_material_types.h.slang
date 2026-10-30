@@ -70,6 +70,7 @@ struct PbrMaterial
   float  clearcoat;           // KHR_materials_clearcoat
   float  clearcoatRoughness;  //
   float3 Nc;                  // clearcoat normal
+  float  clearcoatIsLobe;     // 1: the clearcoat slot holds a second specular lobe, not a coat
 
   float iridescence;  // KHR_materials_iridescence
   float iridescenceIor;
@@ -136,6 +137,7 @@ PbrMaterial defaultPbrMaterial()
   mat.diffuseTransmissionColorFactor = float3(1.0F);
 
   mat.retroreflection = 0.0F;
+  mat.clearcoatIsLobe = 0.0F;
 
   return mat;
 }
