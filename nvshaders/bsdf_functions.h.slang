@@ -356,13 +356,27 @@ bool bsdfFresnelInLobes(PbrMaterial mat)
   return mat.iridescence <= 0.0F && mat.ior2 >= mat.ior1;
 }
 
+// The albedo of a lobe weighing its microfacets by the exact dielectric Fresnel (BSDF_FRESNEL_DIELECTRIC) of
+// `eta`: the table's, which is Schlick's, moved by how far Schlick is from it at the view's typical microfacet.
+// Schlick falls up to 0.02 short at eta 1.5, which the layers below were then charged too little for: a white
+// base gave back 2% more than it was lit with, and 3.7% under a coat.
+float ggxDielectricAlbedo(float eta, float alpha, float NoV)
+{
+  const float2 sb      = ggxAlbedoScaleBias(alpha, NoV);
+  const float  f0      = dielectricF0(eta);
+  const float  cosine  = fresnelCosineApproximation(clamp(NoV, 0.0F, 1.0F), alpha);
+  const float  m       = 1.0F - cosine;
+  const float  schlick = f0 + (1.0F - f0) * m * m * m * m * m;
+  return clamp(f0 * sb.x + sb.y + (ior_fresnel(eta, cosine) - schlick) * (sb.x + sb.y), 0.0F, 1.0F);
+}
+
 // The share of the light at view cosine `VdotN` the dielectric specular lobe reflects
 // (bsdfFresnelInLobes): specular, its colour's largest channel, and the lobe's albedo
 float bsdfSpecularAlbedo(PbrMaterial mat, float VdotN)
 {
   const float colour = min(max(mat.specularColor.x, max(mat.specularColor.y, mat.specularColor.z)), 1.0F);
   const float alpha  = 0.5F * (mat.roughness.x + mat.roughness.y);
-  return clamp(mat.specular * colour * ggxSchlickAlbedo(dielectricF0(mat.ior2 / mat.ior1), alpha, VdotN), 0.0F, 1.0F);
+  return clamp(mat.specular * colour * ggxDielectricAlbedo(mat.ior2 / mat.ior1, alpha, VdotN), 0.0F, 1.0F);
 }
 
 // The clearcoat's, likewise: its index 1.5 against ior1, its own roughness
@@ -374,7 +388,41 @@ bool bsdfClearcoatFresnelInLobe(PbrMaterial mat)
 float bsdfClearcoatAlbedo(PbrMaterial mat, float VdotN)
 {
   const float alpha = mat.clearcoatRoughness * mat.clearcoatRoughness;
-  return clamp(mat.clearcoat * ggxSchlickAlbedo(dielectricF0(1.5F / mat.ior1), alpha, VdotN), 0.0F, 1.0F);
+  return clamp(mat.clearcoat * ggxDielectricAlbedo(1.5F / mat.ior1, alpha, VdotN), 0.0F, 1.0F);
+}
+
+/*-------------------------------------------------------------------------------------------------
+# Function `bsdfCoatDarkening`
+> What a coat takes from the base under it, past what it reflects at the view: light the coat reflects
+> back inside meets the base again, and a dark base absorbs it, so a coated dark surface looks deeper.
+> OpenPBR 1.1's (1 - K) / (1 - E K), with E the base's albedo and K what the inside of a coat of index
+> 1.5 reflects: 0.09 over a smooth base, 0.6 over a rough one, by Fresnel's average over the hemisphere.
+> White keeps its energy, as does clear glass, whose light leaves through it. `coat` is the coverage,
+> `roughness` the base's GGX alpha.
+-------------------------------------------------------------------------------------------------*/
+float3 bsdfCoatDarkening(float coat, float3 baseColor, float metallic, float transmission, float roughness)
+{
+  const float kSmooth   = 0.0918F;                                           // F_avg(1.5)
+  const float kRough    = 1.0F - (1.0F - kSmooth) / (1.5F * 1.5F);           // 0.5964
+  const float dielectricSpecularity = kSmooth;                               // the base's own, at about the same index
+  const float specular  = dielectricSpecularity + (1.0F - dielectricSpecularity) * metallic;
+  const float k         = kSmooth + (kRough - kSmooth) * (1.0F + (sqrt(roughness) - 1.0F) * specular);
+  const float3 opaque   = baseColor + (float3(1.0F) - baseColor) * dielectricSpecularity;
+  const float3 dielectric = opaque + (float3(1.0F) - opaque) * transmission;
+  const float3 albedo   = dielectric + (baseColor - dielectric) * metallic;
+  const float3 darkened = float3(1.0F - k) / (float3(1.0F) - albedo * k);
+  return float3(1.0F) + (darkened - float3(1.0F)) * coat;
+}
+
+// How much of a surface's emission comes out through its coat at `VdotN`: emission lies under the coat,
+// so it loses what the coat reflects and what it gives back to the base. From the row's factors in a light
+// sample, which reads no textures but the emission's. Not under DAZ's second lobe, which is no layer.
+float3 bsdfCoatEmission(float coat, float coatIsLobe, float coatRoughness, float3 baseColor, float metallic, float transmission, float roughness, float VdotN)
+{
+  if(coat <= 0.0F || coatIsLobe > 0.0F)
+    return float3(1.0F);
+  const float reflected = clamp(coat * ggxDielectricAlbedo(1.5F, coatRoughness * coatRoughness, VdotN), 0.0F, 1.0F);
+  return (1.0F - reflected) * bsdfCoatDarkening(coat, baseColor, metallic, transmission, roughness);
 }
 
 /*-------------------------------------------------------------------------------------------------
@@ -397,6 +445,9 @@ ARRAY_TYPE(float, LOBE_COUNT, ) computeLobeWeights(PbrMaterial mat, float VdotN,
   float frCoat = 0.0F;
   if(mat.clearcoat > 0.0f)
   {
+    // A coat, seen from outside. The slot may hold DAZ's second specular lobe, which is no layer.
+    if(mat.clearcoatIsLobe <= 0.0F && mat.ior1 <= 1.0F)
+      tint *= bsdfCoatDarkening(mat.clearcoat, tint, mat.metallic, mat.transmission, 0.5F * (mat.roughness.x + mat.roughness.y));
     if(bsdfClearcoatFresnelInLobe(mat))
     {
       frCoat = bsdfClearcoatAlbedo(mat, VdotN);
