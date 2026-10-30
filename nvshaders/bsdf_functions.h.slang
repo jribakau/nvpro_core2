@@ -1262,7 +1262,8 @@ void brdf_sheen_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial ma
 
   const float3 k10 = float3(dot(data.k1, mat.T), dot(data.k1, mat.B), nk1);
 
-  float        xiFlip = data.xi.z;
+  // xi.z chose this lobe, so here it lies only within the lobe's share of [0,1]: the flip needs its own
+  float        xiFlip = rerandomize(data.xi.z);
   const float3 h0     = flip(hvd_sheen_sample(data.xi.xy, invRoughness), k10, xiFlip);
 
   if(abs(h0.z) == 0.0f)
