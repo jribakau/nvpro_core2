@@ -70,6 +70,7 @@ struct PbrMaterial
   float  clearcoat;           // KHR_materials_clearcoat
   float  clearcoatRoughness;  //
   float3 Nc;                  // clearcoat normal
+  float3 clearcoatColor;      // tints the coat's own reflection; what lies under it keeps its share
 
   // A second specular lobe under the coat, on the base's normal: DAZ's tight dual lobe, skin's wet
   // highlight over its broad one. No layer: it darkens nothing.
@@ -128,6 +129,7 @@ PbrMaterial defaultPbrMaterial()
   mat.clearcoat          = 0.0F;
   mat.clearcoatRoughness = 0.01F;
   mat.Nc                 = float3(0.0F, 0.0F, 1.0F);
+  mat.clearcoatColor     = float3(1.0F);
 
   mat.iridescence          = 0.0F;
   mat.iridescenceIor       = 1.5F;

@@ -1469,10 +1469,10 @@ BsdfLobeFresnel bsdfLobeFresnel(PbrMaterial mat, int lobe, float VdotN, float3 t
   }
   else if(lobe == LOBE_CLEARCOAT_REFLECTION)
   {
-    f.tint = float3(1.0F);
+    f.tint = mat.clearcoatColor;
     if(bsdfClearcoatFresnelInLobe(mat))
     {
-      f.tint    = float3(mat.clearcoat / max(bsdfClearcoatAlbedo(mat, VdotN), 1e-6F));
+      f.tint    = mat.clearcoatColor * (mat.clearcoat / max(bsdfClearcoatAlbedo(mat, VdotN), 1e-6F));
       f.fresnel = BSDF_FRESNEL_DIELECTRIC;
       f.eta     = 1.5F / mat.ior1;
     }
