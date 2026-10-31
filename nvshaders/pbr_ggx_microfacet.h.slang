@@ -584,7 +584,7 @@ float V_Sheen(float NdotL, float NdotV, float sheenRoughness)
 // Lambertian: c / pi.
 float3 BRDF_lambertian(float3 diffuseColor)
 {
-  return diffuseColor * M_1_PI;
+  return diffuseColor * M_1_OVER_PI;
 }
 
 

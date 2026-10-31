@@ -687,7 +687,7 @@ void brdf_diffuse_softened(PbrMaterial mat, float3 tint, float3 k2, NVSHADERS_OU
   const float  pN   = diffuseSofteningMixN(mat);
   const float3 s    = mat.diffuseSoftening;
   pdf               = (pN * cosN + (1.0f - pN) * cosS) * M_1_PI;
-  value = tint * M_1_PI * ((float3(1.0f) - s) * (cosN * shadowTerminatorTerm(k2, mat.N, mat.Ns)) + s * cosS);
+  value = tint * M_1_OVER_PI * ((float3(1.0f) - s) * (cosN * shadowTerminatorTerm(k2, mat.N, mat.Ns)) + s * cosS);
 }
 
 // Evaluates a diffuse lobe.
