@@ -18,7 +18,9 @@ if(NVPRO2_ENABLE_nvmcp AND NOT TARGET mcp)
     GIT_REPOSITORY "https://github.com/hkr04/cpp-mcp.git"
     GIT_TAG f1117d5286efe6477ddd14322703f034615b6c0e
     GIT_SUBMODULES ""
-    PATCH_COMMAND ${CMAKE_COMMAND} -E chdir <SOURCE_DIR> git apply --unidiff-zero --whitespace=nowarn
+    # A reconfigure runs the patch step again over the patched checkout: put the file back first
+    PATCH_COMMAND ${CMAKE_COMMAND} -E chdir <SOURCE_DIR> git checkout -- src/mcp_server.cpp
+          COMMAND ${CMAKE_COMMAND} -E chdir <SOURCE_DIR> git apply --unidiff-zero --whitespace=nowarn
                   "${CMAKE_CURRENT_LIST_DIR}/cpp_mcp-exclusive-bind.patch"
     SOURCE_SUBDIR src
   )
