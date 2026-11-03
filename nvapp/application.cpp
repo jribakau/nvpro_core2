@@ -842,6 +842,7 @@ void nvapp::Application::advanceFrame(uint32_t frameInFlights)
 {
   // Move to the next frame
   m_frameRingCurrent = (m_frameRingCurrent + 1) % frameInFlights;
+  m_resourceFree.frameAdvanced();  // what is queued from here on is the next iteration's
 }
 
 //-----------------------------------------------------------------------
@@ -1270,9 +1271,9 @@ VkResult nvapp::Application::encodeScreenShotToPng(std::vector<uint8_t>& pngData
 }
 
 
-// Runs `func` once every frame submitted so far has completed (ResourceFreeRing). From onUpdate()
-// that is the previous frame, still in flight while the update runs; from onRender() the frame
-// being recorded.
+// Runs `func` once the frame of this loop iteration has completed (ResourceFreeRing): by then so
+// has the previous frame, in flight while onUpdate() runs, and this one, which onUpdate()'s copies
+// and onRender() record into.
 void nvapp::Application::submitResourceFree(std::function<void()>&& func)
 {
   m_resourceFree.submit(std::move(func));

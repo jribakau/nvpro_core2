@@ -11,17 +11,19 @@
 
 namespace nvapp {
 
-// Closures that free GPU resources, each run once every frame submitted before it was queued has
-// completed.
+// Closures that free GPU resources, each run once the frame of the loop iteration it was queued
+// in has completed.
 //
-// The frame loop keeps one queue per slot of its frame ring. When the loop comes back to a slot it
-// has waited for the frame that last used it, and runs that slot's queue. A closure joins the queue
-// of the frame submitted last, or being recorded: when that frame has completed, so has everything
-// that could still read what the closure frees.
+// An iteration updates, waits for the frame that last used its ring slot, records its frame and
+// submits it. What the update queues may be read by the frame in flight (the previous one, bound
+// to what the update changed) and by the frame about to be recorded (an update's copy reads the
+// image it replaces). Both have completed once this iteration's frame has. So a closure queued
+// anywhere in an iteration joins that iteration's slot, whose queue runs when the loop is back at
+// the slot, after its wait for that frame.
 //
-// Queuing it under the slot the loop is at would not do: the loop's update step runs before its
-// wait, so a closure queued there ran in the same iteration, with the last frame still in flight.
-// A texture moved in the update was destroyed under the previous frame's path trace that way.
+// Queuing straight into the slot would not do: the update runs before the wait and the slot's
+// drain, so a closure queued in the update ran in the same iteration, with the previous frame
+// still in flight. A texture moved in an update was destroyed under that frame's path trace.
 class ResourceFreeRing
 {
 public:
@@ -30,28 +32,35 @@ public:
   {
     runAll();
     m_queues.assign(slots, {});
-    m_slot = 0;
+    m_held.clear();
+    m_slot = kNoSlot;
   }
 
   void submit(std::function<void()>&& closure)
   {
     if(m_queues.empty())
       closure();
+    else if(m_slot == kNoSlot)
+      m_held.emplace_back(std::move(closure));  // before this iteration's drain: its slot comes then
     else
       m_queues[m_slot].emplace_back(std::move(closure));
   }
 
   // The loop is back at `slot` and the frame that last used it has completed: its queue runs.
-  // What is queued from here until the loop is back at the next slot waits for the frame recorded
-  // in this one.
+  // What this iteration has queued so far, and queues until it advances, is this slot's.
   void frameCompleted(uint32_t slot)
   {
     if(slot >= m_queues.size())
       return;
     for(std::function<void()>& closure : std::exchange(m_queues[slot], {}))
       closure();
+    m_queues[slot] = std::move(m_held);
+    m_held.clear();
     m_slot = slot;
   }
+
+  // The iteration's frame is submitted: what is queued from here on belongs to the next iteration.
+  void frameAdvanced() { m_slot = kNoSlot; }
 
   // Everything queued, including what a closure queues while running: for a device going idle.
   void runAll()
@@ -65,14 +74,22 @@ public:
           ran = true;
           closure();
         }
+      for(std::function<void()>& closure : std::exchange(m_held, {}))
+      {
+        ran = true;
+        closure();
+      }
     }
   }
 
   uint32_t slots() const { return uint32_t(m_queues.size()); }
 
 private:
+  static constexpr uint32_t kNoSlot = ~0u;
+
   std::vector<std::vector<std::function<void()>>> m_queues;
-  uint32_t                                        m_slot = 0;
+  std::vector<std::function<void()>>              m_held;  // this iteration's, before its drain
+  uint32_t                                        m_slot = kNoSlot;
 };
 
 }  // namespace nvapp
