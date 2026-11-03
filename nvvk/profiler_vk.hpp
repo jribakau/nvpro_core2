@@ -38,6 +38,12 @@ public:
   nvutils::ProfilerTimeline*       getProfilerTimeline() { return m_profilerTimeline; }
   const nvutils::ProfilerTimeline* getProfilerTimeline() const { return m_profilerTimeline; }
 
+  // Called in the command buffer at each frame and update section's start (with its name) and end (with
+  // nullptr): an application marks its own checkpoints there, such as NVIDIA's diagnostic ones, so a lost
+  // device's queue says which section it was in. Those sections nest, so an end closes the last start.
+  using SectionHook = void (*)(VkCommandBuffer cmd, const char* name);
+  static inline SectionHook sectionHook = nullptr;
+
   // not thread-safe
   nvutils::ProfilerTimeline::FrameSectionID cmdFrameBeginSection(VkCommandBuffer cmd, const std::string& name);
   void cmdFrameEndSection(VkCommandBuffer cmd, nvutils::ProfilerTimeline::FrameSectionID slot);

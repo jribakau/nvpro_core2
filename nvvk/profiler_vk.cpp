@@ -122,6 +122,8 @@ nvutils::ProfilerTimeline::FrameSectionID ProfilerGpuTimer::cmdFrameBeginSection
 
   // log timestamp
   vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool, idxInPool);
+  if(sectionHook)
+    sectionHook(cmd, name.c_str());
 
   return sec;
 }
@@ -137,6 +139,8 @@ void ProfilerGpuTimer::cmdFrameEndSection(VkCommandBuffer cmd, nvutils::Profiler
   {
     vkCmdEndDebugUtilsLabelEXT(cmd);
   }
+  if(sectionHook)
+    sectionHook(cmd, nullptr);
   m_profilerTimeline->frameEndSection(sec);
 }
 
@@ -162,6 +166,8 @@ nvutils::ProfilerTimeline::UpdateSectionID ProfilerGpuTimer::cmdUpdateBeginSecti
 
   // log timestamp
   vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool, idxInPool);
+  if(sectionHook)
+    sectionHook(cmd, name.c_str());
 
   return sec;
 }
@@ -177,6 +183,8 @@ void ProfilerGpuTimer::cmdUpdateEndSection(VkCommandBuffer cmd, nvutils::Profile
   {
     vkCmdEndDebugUtilsLabelEXT(cmd);
   }
+  if(sectionHook)
+    sectionHook(cmd, nullptr);
   m_profilerTimeline->updateEndSection(sec);
 }
 
