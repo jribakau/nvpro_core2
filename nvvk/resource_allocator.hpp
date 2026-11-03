@@ -119,6 +119,12 @@ public:
   VkPhysicalDevice getPhysicalDevice() const { return m_physicalDevice; }
   VkDeviceSize     getMaxMemoryAllocationSize() const { return m_maxMemoryAllocationSize; }
 
+  // Called with a buffer's GPU address range once it is made (`made` true) and before it is destroyed, from
+  // whichever thread does it, every allocator alike (an acceleration structure's buffer too): an application
+  // keeps a journal there, so that the address of a device fault can be named.
+  using BufferHook = void (*)(VkBuffer buffer, VkDeviceAddress address, VkDeviceSize size, bool made);
+  static inline BufferHook bufferHook = nullptr;
+
   //////////////////////////////////////////////////////////////////////////
 
   // Create a VkBuffer

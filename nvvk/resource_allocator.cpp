@@ -22,6 +22,7 @@
 
 #include "resource_allocator.hpp"
 #include "check_error.hpp"
+#include "debug_util.hpp"
 
 #include <volk.h>
 
@@ -186,6 +187,8 @@ VkResult nvvk::ResourceAllocator::createBuffer(nvvk::Buffer&                  re
   resultBuffer.address = vkGetBufferDeviceAddress(m_device, &info);
 
   addLeakDetection(resultBuffer.allocation);
+  if(bufferHook)
+    bufferHook(resultBuffer.buffer, resultBuffer.address, resultBuffer.bufferSize, true);
 
   return result;
 }
@@ -198,6 +201,8 @@ void nvvk::ResourceAllocator::destroyBuffer(nvvk::Buffer& buffer) const
     return;
   }
 
+  if(bufferHook)
+    bufferHook(buffer.buffer, buffer.address, buffer.bufferSize, false);
   vmaDestroyBuffer(m_allocator, buffer.buffer, buffer.allocation);
   buffer = {};
 }
@@ -657,6 +662,9 @@ VkResult nvvk::ResourceAllocator::createAcceleration(nvvk::AccelerationStructure
                                                      .accelerationStructure = resultAccel.accel};
     resultAccel.address = vkGetAccelerationStructureDeviceAddressKHR(m_device, &info);
   }
+  // what its buffer is, should a device fault's address be in it (BufferHook)
+  DebugUtil::getInstance().setObjectName(resultAccel.buffer.buffer,
+                                         accelStruct.type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR ? "a TLAS" : "a BLAS");
 
   return result;
 }

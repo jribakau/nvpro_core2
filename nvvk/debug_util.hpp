@@ -50,13 +50,20 @@ public:
 
   bool isInitialized() const { return m_device != VK_NULL_HANDLE; }
 
+  // Called with every name given, whether or not the debug utils extension is there: an application keeps
+  // the names it wants (a buffer's, to name a device fault's address)
+  using NameHook = void (*)(VkObjectType type, uint64_t handle, const char* name);
+  static inline NameHook nameHook = nullptr;
+
   template <typename T>
   void setObjectName(T object, const std::string& name) const
   {
+    constexpr VkObjectType objectType = getObjectType<T>();
+    if(nameHook && objectType != VK_OBJECT_TYPE_UNKNOWN)
+      nameHook(objectType, (uint64_t)object, name.c_str());
+
     if(!isInitialized())
       return;
-
-    constexpr VkObjectType objectType = getObjectType<T>();
 
     if(vkSetDebugUtilsObjectNameEXT != nullptr && objectType != VK_OBJECT_TYPE_UNKNOWN && m_device != VK_NULL_HANDLE)
     {
