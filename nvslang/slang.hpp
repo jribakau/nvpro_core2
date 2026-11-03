@@ -53,6 +53,9 @@ public:
   //
   // Set `enableGLSL` to `true` to enable the Slang compatibility module (which is loaded when a Slang file includes a `#version` directive).
   // If enabled, you will also need to add `FILES ${Slang_GLSL_MODULE}` to your CMake `copy_to_runtime_and_install` call.
+  //
+  // The global session (Slang's core module: some 160 MB and 100 ms) is made by the first compile, not
+  // here, so a compiler that only ever stands by while SPIR-V comes from a cache never makes one.
   SlangCompiler(bool enableGLSL = false);
   ~SlangCompiler() = default;
 
@@ -76,11 +79,18 @@ public:
   void clearMacros() { m_macros.clear(); }
   std::vector<slang::PreprocessorMacroDesc>& macros() { return m_macros; }
 
-  // Set the profile by name (e.g., "sm_6_6")
-  bool setProfile(const char* profileName);
+  // Set the profile by name (e.g., "sm_6_6"). Names are looked up when a compile makes its session, which
+  // warns of one this Slang does not know; until then they are kept as given (profile(), capabilities()).
+  void               setProfile(const char* profileName) { m_profile = profileName; }
+  const std::string& profile() const { return m_profile; }
 
   // Add a capability by name to the target (e.g., "spvShaderInvocationReorderNV")
-  bool addCapability(const char* capabilityName);
+  void addCapability(const char* capabilityName) { m_capabilities.emplace_back(capabilityName); }
+  void clearCapabilities() { m_capabilities.clear(); }
+  const std::vector<std::string>& capabilities() const { return m_capabilities; }
+
+  // Whether a compile has made the global session yet
+  bool hasGlobalSession() const { return m_globalSession != nullptr; }
 
   // Compile a file or source
   bool compileFile(const std::filesystem::path& filename);
@@ -111,9 +121,15 @@ private:
   bool createSession();
   void logAndAppendDiagnostics(slang::IBlob* diagnostic);
 
+  bool                                      m_enableGLSL = false;
   Slang::ComPtr<slang::IGlobalSession>      m_globalSession;
   std::vector<slang::TargetDesc>            m_targets;
   std::vector<slang::CompilerOptionEntry>   m_options;
+  std::string                               m_profile;
+  std::vector<std::string>                  m_capabilities;
+  // What the session was made with: the targets and options with the names looked up
+  std::vector<slang::TargetDesc>            m_sessionTargets;
+  std::vector<slang::CompilerOptionEntry>   m_sessionOptions;
   std::vector<std::filesystem::path>        m_searchPaths;
   std::vector<std::string>                  m_searchPathsUtf8;
   std::vector<const char*>                  m_searchPathsUtf8Pointers;
@@ -122,7 +138,6 @@ private:
   Slang::ComPtr<slang::IComponentType>      m_linkedProgram;
   Slang::ComPtr<ISlangBlob>                 m_spirv;
   std::vector<slang::PreprocessorMacroDesc> m_macros;
-  SlangProfileID                            m_profileID{SLANG_PROFILE_UNKNOWN};
 
   std::function<void(const std::filesystem::path& sourceFile, const uint32_t* spirvCode, size_t spirvSize)> m_callback;
 

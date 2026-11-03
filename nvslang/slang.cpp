@@ -21,23 +21,22 @@
 
 
 nvslang::SlangCompiler::SlangCompiler(bool enableGLSL)
+    : m_enableGLSL(enableGLSL)
 {
-  SlangGlobalSessionDesc desc{.enableGLSL = enableGLSL};
-  slang::createGlobalSession(&desc, m_globalSession.writeRef());
 }
 
 void nvslang::SlangCompiler::defaultTarget()
 {
-  if(m_profileID == SLANG_PROFILE_UNKNOWN)
+  if(m_profile.empty())
   {
     // Use SPIR-V 1.6 as the default profile for Vulkan/SPIR-V target
-    m_profileID = m_globalSession->findProfile("spirv_1_6");
+    m_profile = "spirv_1_6";
   }
 
+  // the profile is set from the name when a compile makes its session
   m_targets.clear();
   m_targets.push_back({
       .format                      = SLANG_SPIRV,
-      .profile                     = m_profileID,
       .flags                       = SLANG_TARGET_FLAG_GENERATE_SPIRV_DIRECTLY,
       .forceGLSLScalarBufferLayout = true,
   });
@@ -48,31 +47,6 @@ void nvslang::SlangCompiler::defaultOptions()
   m_options.push_back({slang::CompilerOptionName::EmitSpirvDirectly, {slang::CompilerOptionValueKind::Int, 1}});
   m_options.push_back({slang::CompilerOptionName::VulkanUseEntryPointName, {slang::CompilerOptionValueKind::Int, 1}});
   // m_options.push_back({slang::CompilerOptionName::AllowGLSL, {slang::CompilerOptionValueKind::Int, 1}});
-}
-
-bool nvslang::SlangCompiler::setProfile(const char* profileName)
-{
-  SlangProfileID profileId = m_globalSession->findProfile(profileName);
-  if(profileId == SLANG_PROFILE_UNKNOWN)
-  {
-    LOGW("Unknown profile: %s\n", profileName);
-    return false;
-  }
-  m_profileID = profileId;
-  return true;
-}
-
-bool nvslang::SlangCompiler::addCapability(const char* capabilityName)
-{
-  SlangCapabilityID capabilityId = m_globalSession->findCapability(capabilityName);
-  if(capabilityId == SLANG_CAPABILITY_UNKNOWN)
-  {
-    LOGW("Unknown capability: %s\n", capabilityName);
-    return false;
-  }
-  m_options.push_back({slang::CompilerOptionName::Capability,
-                       {slang::CompilerOptionValueKind::Int, static_cast<int32_t>(capabilityId)}});
-  return true;
 }
 
 void nvslang::SlangCompiler::addSearchPaths(const std::vector<std::filesystem::path>& searchPaths)
@@ -237,17 +211,49 @@ bool nvslang::SlangCompiler::createSession()
     return false;
   }
 
-  m_targets[0].profile = m_profileID;
+  if(!m_globalSession)
+  {
+    SlangGlobalSessionDesc globalDesc{.enableGLSL = m_enableGLSL};
+    slang::createGlobalSession(&globalDesc, m_globalSession.writeRef());
+    if(!m_globalSession)
+    {
+      LOGW("Slang: no global session\n");
+      return false;
+    }
+  }
+
+  // The names as this Slang numbers them, into copies: targets() and options() stay as they were set,
+  // so what is read of them (a cache key, a copy for another compiler) is the same before and after.
+  m_sessionTargets = m_targets;
+  if(!m_profile.empty())
+  {
+    m_sessionTargets[0].profile = m_globalSession->findProfile(m_profile.c_str());
+    if(m_sessionTargets[0].profile == SLANG_PROFILE_UNKNOWN)
+      LOGW("Unknown profile: %s\n", m_profile.c_str());
+  }
+  m_sessionOptions = m_options;
+  for(const std::string& name : m_capabilities)
+  {
+    const SlangCapabilityID capabilityId = m_globalSession->findCapability(name.c_str());
+    if(capabilityId == SLANG_CAPABILITY_UNKNOWN)
+    {
+      LOGW("Unknown capability: %s\n", name.c_str());
+      continue;
+    }
+    m_sessionOptions.push_back({slang::CompilerOptionName::Capability,
+                                {slang::CompilerOptionValueKind::Int, static_cast<int32_t>(capabilityId)}});
+  }
+
   slang::SessionDesc desc{
-      .targets                  = m_targets.data(),
-      .targetCount              = SlangInt(m_targets.size()),
+      .targets                  = m_sessionTargets.data(),
+      .targetCount              = SlangInt(m_sessionTargets.size()),
       .searchPaths              = m_searchPathsUtf8Pointers.data(),
       .searchPathCount          = SlangInt(m_searchPathsUtf8Pointers.size()),
       .preprocessorMacros       = m_macros.data(),
       .preprocessorMacroCount   = SlangInt(m_macros.size()),
       .allowGLSLSyntax          = true,
-      .compilerOptionEntries    = m_options.data(),
-      .compilerOptionEntryCount = uint32_t(m_options.size()),
+      .compilerOptionEntries    = m_sessionOptions.data(),
+      .compilerOptionEntryCount = uint32_t(m_sessionOptions.size()),
   };
   m_globalSession->createSession(desc, m_session.writeRef());
 
