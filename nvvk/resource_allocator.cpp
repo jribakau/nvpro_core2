@@ -567,7 +567,49 @@ VkResult nvvk::ResourceAllocator::createImage(nvvk::Image& image, const VkImageC
 
   addLeakDetection(image.allocation);
 
+  if(result == VK_SUCCESS && imageHook)
+    imageHook(image.image, imageAddress(image.allocation), allocInfoOut.size, imageInSystemMemory(image.allocation), true);
+
   return result;
+}
+
+// An image has no device address of its own. Its memory does: a buffer bound over the same range tells it, and goes
+// again. Not for memory dedicated to the image, which nothing else may bind: 0.
+VkDeviceAddress nvvk::ResourceAllocator::imageAddress(VmaAllocation allocation) const
+{
+  VmaAllocationInfo2 info{};
+  vmaGetAllocationInfo2(m_allocator, allocation, &info);
+  if(info.dedicatedMemory || info.allocationInfo.size == 0)
+    return 0;
+  const VkBufferCreateInfo bufferInfo{
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+      .size  = info.allocationInfo.size,
+      .usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+  };
+  VkBuffer alias = VK_NULL_HANDLE;
+  if(vkCreateBuffer(m_device, &bufferInfo, nullptr, &alias) != VK_SUCCESS)
+    return 0;
+  VkMemoryRequirements needs{};
+  vkGetBufferMemoryRequirements(m_device, alias, &needs);
+  VkDeviceAddress address = 0;
+  if((needs.memoryTypeBits & (1u << info.allocationInfo.memoryType)) && needs.size <= info.allocationInfo.size
+     && info.allocationInfo.offset % needs.alignment == 0
+     && vkBindBufferMemory(m_device, alias, info.allocationInfo.deviceMemory, info.allocationInfo.offset) == VK_SUCCESS)
+  {
+    const VkBufferDeviceAddressInfo addressInfo{.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = alias};
+    address = vkGetBufferDeviceAddress(m_device, &addressInfo);
+  }
+  vkDestroyBuffer(m_device, alias, nullptr);
+  return address;
+}
+
+bool nvvk::ResourceAllocator::imageInSystemMemory(VmaAllocation allocation) const
+{
+  VmaAllocationInfo info{};
+  vmaGetAllocationInfo(m_allocator, allocation, &info);
+  VkMemoryPropertyFlags flags{};
+  vmaGetMemoryTypeProperties(m_allocator, info.memoryType, &flags);
+  return (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0;
 }
 
 VkResult nvvk::ResourceAllocator::createImage(nvvk::Image& image, const VkImageCreateInfo& imageInfo) const
@@ -610,6 +652,8 @@ VkResult nvvk::ResourceAllocator::createImage(Image&                         ima
 
 void nvvk::ResourceAllocator::destroyImage(Image& image) const
 {
+  if(imageHook && image.image)
+    imageHook(image.image, 0, 0, false, false);
   vkDestroyImageView(m_device, image.descriptor.imageView, nullptr);
   vmaDestroyImage(m_allocator, image.image, image.allocation);
   image = {};

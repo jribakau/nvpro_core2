@@ -124,6 +124,12 @@ public:
   // keeps a journal there, so that the address of a device fault can be named.
   using BufferHook = void (*)(VkBuffer buffer, VkDeviceAddress address, VkDeviceSize size, bool made);
   static inline BufferHook bufferHook = nullptr;
+  // The same for an image, with the address its memory has (0 when the memory is dedicated to it, which no buffer may
+  // bind to tell) and whether that memory is system memory, the device's being full.
+  using ImageHook = void (*)(VkImage image, VkDeviceAddress address, VkDeviceSize size, bool systemMemory, bool made);
+  static inline ImageHook imageHook = nullptr;
+  VkDeviceAddress         imageAddress(VmaAllocation allocation) const;
+  bool                    imageInSystemMemory(VmaAllocation allocation) const;
 
   //////////////////////////////////////////////////////////////////////////
 
