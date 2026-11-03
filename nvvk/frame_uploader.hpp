@@ -54,6 +54,12 @@ public:
     // if true, staging memory is guaranteed to have VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
     // if false, non-coherent host memory may be used and is flushed before GPU copy
     bool forceCoherentMapping = true;
+
+    // drained blocks kept for reuse rather than destroyed, beside the one being written
+    uint32_t keepBlockCount = 1;
+    // the most blocks of staging held at once (blockSize each, until the GPU is done with them);
+    // non-coherent memory is flushed by a 64-bit mask of blocks, so it holds 64 at most
+    uint32_t maxBlocks = 64;
   };
 
   struct Stats
@@ -64,6 +70,9 @@ public:
 
   VkResult init(const InitInfo& info);
   void     deinit();
+
+  // the staging blocks held and what in them is still live
+  nvvk::BufferCircularAllocator::Report getStagingReport() const { return m_bufferCircularAllocator.getReport(); }
 
   void updateFrameSemaphoreState(const nvvk::SemaphoreState& semaphoreState);
   void releaseCompletedAllocations(bool forceAll = false);

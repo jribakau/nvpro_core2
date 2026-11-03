@@ -17,6 +17,7 @@
 * SPDX-License-Identifier: Apache-2.0
 */
 
+#include <algorithm>
 #include <cassert>
 
 #include <volk.h>
@@ -52,7 +53,9 @@ VkResult FrameUploader::init(const InitInfo& info)
   circInitInfo.resourceAllocator = info.allocator;
   circInitInfo.debugName         = info.debugName;
   circInitInfo.blockSize         = info.blockSize;
-  circInitInfo.maxAllocatedSize  = info.blockSize * MAX_FLUSH_BLOCKS;
+  circInitInfo.keepBlockCount    = info.keepBlockCount;
+  const uint32_t maxBlocks       = std::min(info.maxBlocks, info.forceCoherentMapping ? nvvk::BufferCircularAllocator::MAX_TOTAL_BLOCKS : MAX_FLUSH_BLOCKS);
+  circInitInfo.maxAllocatedSize  = info.blockSize * maxBlocks;
 
   result = NVVK_FAIL_REPORT(m_bufferCircularAllocator.init(circInitInfo));
   if(result != VK_SUCCESS)
@@ -145,9 +148,10 @@ VkResult FrameUploader::acquireMapping(size_t dataSize, nvvk::BufferRange& mappi
   nvvk::BufferCircularAllocation subAllocation;
   NVVK_FAIL_RETURN(acquireStagingSpace(subAllocation, mappingSpace, dataSize, nullptr));
 
-  if(subAllocation.getBlockIndex() >= MAX_FLUSH_BLOCKS)
+  // non-coherent staging is flushed by a 64-bit mask of blocks; coherent staging is never flushed
+  if(!m_forceCoherentMapping && subAllocation.getBlockIndex() >= MAX_FLUSH_BLOCKS)
   {
-    assert(0 && "FrameUploader supports at most 64 blocks");
+    assert(0 && "FrameUploader supports at most 64 non-coherent blocks");
     return VK_ERROR_OUT_OF_POOL_MEMORY;
   }
 
