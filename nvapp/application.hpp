@@ -36,6 +36,7 @@
 #include <nvvk/resources.hpp>
 #include <nvvk/swapchain.hpp>
 #include "frame_pacer.hpp"
+#include "resource_free_ring.hpp"
 
 /*-------------------------------------------------------------------------------------------------
 # class nvapp::Application
@@ -373,7 +374,7 @@ protected:
   float       m_dpiScale{1.f};          // Current scaling due to DPI.
 
   //--
-  std::vector<std::vector<std::function<void()>>> m_resourceFreeQueue;  // Queue of functions to free resources
+  ResourceFreeRing m_resourceFree;  // closures freeing resources, run once the frames that could use them have completed
 
   //--
   std::function<void(ImGuiID)> m_dockSetup;  // Function to setup the docking

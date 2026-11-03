@@ -1270,44 +1270,25 @@ VkResult nvapp::Application::encodeScreenShotToPng(std::vector<uint8_t>& pngData
 }
 
 
+// Runs `func` once every frame submitted so far has completed (ResourceFreeRing). From onUpdate()
+// that is the previous frame, still in flight while the update runs; from onRender() the frame
+// being recorded.
 void nvapp::Application::submitResourceFree(std::function<void()>&& func)
 {
-  if(m_frameRingCurrent < m_resourceFreeQueue.size())
-  {
-    m_resourceFreeQueue[m_frameRingCurrent].emplace_back(func);
-  }
-  else
-  {
-    func();
-  }
+  m_resourceFree.submit(std::move(func));
 }
 
 void nvapp::Application::resetFreeQueue(uint32_t size)
 {
   vkDeviceWaitIdle(m_device);
-
-  for(auto& queue : m_resourceFreeQueue)
-  {
-    // Free resources in queue
-    for(auto& func : queue)
-    {
-      func();
-    }
-    queue.clear();
-  }
-  m_resourceFreeQueue.clear();
-  m_resourceFreeQueue.resize(size);
+  m_resourceFree.reset(size);
 }
 
-// This is called to free all resources that are not used anymore
-// By using the frameRingCurrent we can free resources that are not used anymore
+// After waitForFrameCompletion(): the frame that last used the current ring slot has completed, and
+// with it every frame before it, so what was queued against that frame goes.
 void nvapp::Application::freeResourcesQueue()
 {
-  for(auto& func : m_resourceFreeQueue[m_frameRingCurrent])
-  {
-    func();  // Free resources in queue
-  }
-  m_resourceFreeQueue[m_frameRingCurrent].clear();
+  m_resourceFree.frameCompleted(m_frameRingCurrent);
 }
 
 void nvapp::Application::addWaitSemaphore(const VkSemaphoreSubmitInfo& wait)
