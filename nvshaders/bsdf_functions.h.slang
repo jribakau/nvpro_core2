@@ -960,8 +960,22 @@ float3 bsdfMicrofacetFresnel(int fresnel, float eta, float3 tint, float k1h)
   return tint;
 }
 
+/*-------------------------------------------------------------------------------------------------
+# Function `bsdfGaussianSlopeShare`
+> What a lobe of Gaussian slopes (PbrMaterial::gaussianSlopes) has at microfacet `h0` (local) against
+> the GGX lobe that samples it: Beckmann's distribution over GGX's, `ggxHvd`. Its directions are
+> drawn, and their pdf reported, by GGX's VNDF of the same roughness, whose heavier tail covers
+> Beckmann's: the ratio peaks near 1.5, a microfacet an alpha off the normal, so with the masking's a
+> sample carries about twice what GGX's would at most.
+-------------------------------------------------------------------------------------------------*/
+float bsdfGaussianSlopeShare(PbrMaterial mat, float3 h0, float ggxHvd)
+{
+  return ggxHvd > 0.0f ? hvd_beckmann_eval(1.0f / mat.roughness, h0) / ggxHvd : 0.0f;
+}
+
 // Evaluates a reflective lobe with a GGX NDF and a height-correlated Smith
 // scattering-masking function. `fresnel`, `eta`: how each microfacet's reflection is weighed.
+// Gaussian slopes (PbrMaterial::gaussianSlopes) take Beckmann's NDF and masking under GGX's pdf.
 void brdf_ggx_smith_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat, const int lobe, float3 tint, int fresnel, float eta)
 {
   mat = bsdfSpecularFrame(mat, data.k1);
@@ -996,15 +1010,19 @@ void brdf_ggx_smith_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMateria
   }
 
   // Compute BSDF and pdf.
-  const float3 h0 = float3(dot(mat.T, h), dot(mat.B, h), nh);
+  const float3 h0  = float3(dot(mat.T, h), dot(mat.B, h), nh);
+  const float3 k1l = float3(dot(mat.T, data.k1), dot(mat.B, data.k1), nk1);
+  const float3 k2l = float3(dot(mat.T, data.k2), dot(mat.B, data.k2), nk2);
 
-  data.pdf = hvd_ggx_eval(1.0f / mat.roughness, h0);
+  const float hvd = hvd_ggx_eval(1.0f / mat.roughness, h0);
+  data.pdf        = hvd;
   float G1;
   float G2;
 
   float G12;
-  G12 = ggx_smith_shadow_mask_correlated(G1, G2, float3(dot(mat.T, data.k1), dot(mat.B, data.k1), nk1),
-                                         float3(dot(mat.T, data.k2), dot(mat.B, data.k2), nk2), mat.roughness);
+  G12 = ggx_smith_shadow_mask_correlated(G1, G2, k1l, k2l, mat.roughness);
+  if(mat.gaussianSlopes)
+    G12 = beckmann_smith_shadow_mask_correlated(k1l, k2l, mat.roughness) * bsdfGaussianSlopeShare(mat, h0, hvd);
 
   data.pdf *= 0.25f / (nk1 * nh);
 
@@ -1092,7 +1110,8 @@ void brdf_ggx_smith_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMateria
   float G1;
   float G2;
 
-  float G12 = ggx_smith_shadow_mask_correlated(G1, G2, k10, float3(dot(data.k2, mat.T), dot(data.k2, mat.B), nk2), mat.roughness);
+  const float3 k20 = float3(dot(data.k2, mat.T), dot(data.k2, mat.B), nk2);
+  float        G12 = ggx_smith_shadow_mask_correlated(G1, G2, k10, k20, mat.roughness);
 
   if(G12 <= 0.0f)
   {
@@ -1100,12 +1119,17 @@ void brdf_ggx_smith_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMateria
     return;
   }
 
+  const float hvd = hvd_ggx_eval(1.0f / mat.roughness, h0);
+  // Gaussian slopes: their own distribution and masking, drawn by GGX's (bsdfGaussianSlopeShare)
+  if(mat.gaussianSlopes)
+    G12 = beckmann_smith_shadow_mask_correlated(k10, k20, mat.roughness) * bsdfGaussianSlopeShare(mat, h0, hvd);
+
   // The VNDF sample's pdf has G1: what is left of the joint masking
   data.bsdf_over_pdf = float3(G12 / G1);
   data.event_type    = BSDF_EVENT_GLOSSY_REFLECTION;
 
   // Compute pdf
-  data.pdf = hvd_ggx_eval(1.0f / mat.roughness, h0) * G1;
+  data.pdf = hvd * G1;
   data.pdf *= 0.25f / (nk1 * h0.z);
 
   if(lobe == LOBE_METAL_REFLECTION && fresnel == BSDF_FRESNEL_SCHLICK)
@@ -1285,13 +1309,18 @@ void btdf_ggx_smith_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMateria
   }
 
   // Compute BSDF and pdf
-  const float3 h0 = float3(dot(mat.T, h), dot(mat.B, h), nh);
-  data.pdf        = hvd_ggx_eval(1.0f / mat.roughness, h0);
+  const float3 h0  = float3(dot(mat.T, h), dot(mat.B, h), nh);
+  const float3 k1l = float3(dot(mat.T, data.k1), dot(mat.B, data.k1), nk1);
+  const float3 k2l = float3(dot(mat.T, data.k2), dot(mat.B, data.k2), nk2);
+  const float  hvd = hvd_ggx_eval(1.0f / mat.roughness, h0);
+  data.pdf         = hvd;
 
   float G1;
   float G2;
-  float G12 = ggx_smith_shadow_mask(G1, G2, float3(dot(mat.T, data.k1), dot(mat.B, data.k1), nk1),
-                                    float3(dot(mat.T, data.k2), dot(mat.B, data.k2), nk2), mat.roughness);
+  float G12 = ggx_smith_shadow_mask(G1, G2, k1l, k2l, mat.roughness);
+  // Gaussian slopes: their own distribution and masking under GGX's pdf (bsdfGaussianSlopeShare)
+  if(mat.gaussianSlopes)
+    G12 = beckmann_smith_shadow_mask(k1l, k2l, mat.roughness) * bsdfGaussianSlopeShare(mat, h0, hvd);
 
   if(!isThinWalled && backside)  // Refraction?
   {
@@ -1396,7 +1425,8 @@ void btdf_ggx_smith_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMateria
 
   float G1;
   float G2;
-  float G12 = ggx_smith_shadow_mask(G1, G2, k10, float3(dot(data.k2, mat.T), dot(data.k2, mat.B), nk2), mat.roughness);
+  const float3 k20 = float3(dot(data.k2, mat.T), dot(data.k2, mat.B), nk2);
+  float        G12 = ggx_smith_shadow_mask(G1, G2, k10, k20, mat.roughness);
 
   if(G12 <= 0.0f)
   {
@@ -1404,10 +1434,15 @@ void btdf_ggx_smith_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMateria
     return;
   }
 
-  data.bsdf_over_pdf *= G2;
+  const float hvd = hvd_ggx_eval(1.0f / mat.roughness, h0);
+  // Gaussian slopes: their own distribution and masking, drawn by GGX's (bsdfGaussianSlopeShare)
+  if(mat.gaussianSlopes)
+    data.bsdf_over_pdf *= beckmann_smith_shadow_mask(k10, k20, mat.roughness) * bsdfGaussianSlopeShare(mat, h0, hvd) / G1;
+  else
+    data.bsdf_over_pdf *= G2;
 
   // Compute pdf
-  data.pdf = hvd_ggx_eval(1.0f / mat.roughness, h0) * G1;  // * prob;
+  data.pdf = hvd * G1;  // * prob;
 
 
   if(!isThinWalled && (data.event_type == BSDF_EVENT_GLOSSY_TRANSMISSION))  // if (refraction)

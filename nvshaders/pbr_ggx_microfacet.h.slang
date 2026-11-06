@@ -176,6 +176,67 @@ float ggx_smith_shadow_mask_correlated(NVSHADERS_OUT_TYPE(float) G1, NVSHADERS_O
   return 1.0f / (1.0f / G1 + 1.0f / G2 - 1.0f);
 }
 
+/*-------------------------------------------------------------------------------------------------
+# Function `hvd_beckmann_eval`
+> The anisotropic Beckmann distribution, Gaussian microfacet slopes of RMS alpha / sqrt(2) per axis,
+> as `hvd_ggx_eval` gives GGX's: D(h) times h.z, on the non-projected hemisphere. Its peak is GGX's
+> at the same roughness; its tail falls off as a Gaussian, where GGX's falls as a power: GGX has a
+> fifth of its microfacets more than two alphas off the normal, Beckmann 2%.
+-------------------------------------------------------------------------------------------------*/
+float hvd_beckmann_eval(const float2 invRoughness,
+                        const float3 h)  // == float3(dot(tangent, h), dot(bitangent, h), dot(normal, h))
+{
+  if(h.z <= 0.0f)
+    return 0.0f;
+  const float x = h.x * invRoughness.x / h.z;
+  const float y = h.y * invRoughness.y / h.z;
+  return M_1_PI * invRoughness.x * invRoughness.y * exp(-(x * x + y * y)) / (h.z * h.z * h.z);
+}
+
+/*-------------------------------------------------------------------------------------------------
+# Function `beckmann_shadow_or_mask`
+> Smith's masking of direction `k` (local, as `smith_shadow_or_mask`'s) by Beckmann microfacets:
+> 1 / (1 + Lambda), by Walter et al. 2007's rational fit, within 0.4% of the exact
+> Lambda = (erf(a) - 1) / 2 + exp(-a^2) / (2 a sqrt(pi)), a = 1 / (alpha tan(theta)).
+-------------------------------------------------------------------------------------------------*/
+float beckmann_shadow_or_mask(const float3 k, const float2 roughness)
+{
+  const float kz = abs(k.z);
+  if(kz == 0.0f)
+  {
+    return 0.0f;  // Totally shadowed
+  }
+  const float ax = k.x * roughness.x;
+  const float ay = k.y * roughness.y;
+  const float s2 = ax * ax + ay * ay;
+  if(s2 <= 0.0f)
+  {
+    return 1.0f;
+  }
+  const float a = kz / sqrt(s2);
+  if(a >= 1.6f)
+  {
+    return 1.0f;
+  }
+  return (3.535f * a + 2.181f * a * a) / (1.0f + 2.276f * a + 2.577f * a * a);
+}
+
+// The height-correlated form of Beckmann's, as `ggx_smith_shadow_mask_correlated`: reflection only
+float beckmann_smith_shadow_mask_correlated(const float3 k1, const float3 k2, const float2 roughness)
+{
+  const float G1 = beckmann_shadow_or_mask(k1, roughness);
+  const float G2 = beckmann_shadow_or_mask(k2, roughness);
+  if(G1 <= 0.0f || G2 <= 0.0f)
+    return 0.0f;
+  return 1.0f / (1.0f / G1 + 1.0f / G2 - 1.0f);
+}
+
+// The uncorrelated form, as `ggx_smith_shadow_mask`: what the transmission lobe uses
+float beckmann_smith_shadow_mask(const float3 k1, const float3 k2, const float2 roughness)
+{
+  return beckmann_shadow_or_mask(k1, roughness) * beckmann_shadow_or_mask(k2, roughness);
+}
+
 // Computes the squared norm of s/p polarized Fresnel reflection coefficients and phase shifts in complex unit circle.
 //
 // See Max Born and Emil Wolf, "Principles of Optics", section 13.4.1,

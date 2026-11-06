@@ -66,6 +66,10 @@ struct PbrMaterial
   // A thin-walled surface that is a pane: both its faces reflect (plate_fresnel), not one interface.
   // Only with thickness 0 (bsdfIsPlate).
   bool plate;
+  // The dielectric lobes' microfacet slopes are Gaussian (Beckmann's distribution), not GGX's: a
+  // surface whose roughness is waves too fine to see, as water's ripples (Cox and Munk 1954). GGX
+  // still samples them (bsdfGaussianSlopeShare).
+  bool gaussianSlopes;
 
   float3 attenuationColor;     // KHR_materials_volume
   float  attenuationDistance;  //
@@ -127,6 +131,7 @@ PbrMaterial defaultPbrMaterial()
   mat.transmission     = 0.0F;
   mat.transmissionTint = float3(1.0F);
   mat.plate            = false;
+  mat.gaussianSlopes   = false;
 
   mat.attenuationColor    = float3(1.0F);
   mat.attenuationDistance = 1.0F;
