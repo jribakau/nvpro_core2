@@ -42,6 +42,10 @@ struct PbrMaterial
   float3 B;   // bitangent
   float3 Ng;  // geometric normal
   float3 Ns;  // smooth normal: the shading normal before normal and detail maps (shadowTerminatorTerm)
+  // Whether a scattered direction must leave on the side of Ng its event says (bsdfFaceAllows): a
+  // reflection on Ng's side, a transmission across it. Off for the ground plane and water, whose waves
+  // tilt N over a flat Ng that is no face.
+  bool faceSided;
   // Per channel, 0..1: how much of the diffuse reflection lobe turns about Ns instead of N, as light
   // that spreads under a surface evens out the bumps it entered by (brdf_diffuse_eval). 0: none.
   float3 diffuseSoftening;
@@ -106,6 +110,7 @@ PbrMaterial defaultPbrMaterial()
   mat.N  = float3(0.0F, 0.0F, 1.0F);
   mat.Ng = float3(0.0F, 0.0F, 1.0F);
   mat.Ns = float3(0.0F, 0.0F, 1.0F);
+  mat.faceSided        = true;
   mat.diffuseSoftening = float3(0.0F);
   mat.T  = float3(1.0F, 0.0F, 0.0F);
   mat.B  = float3(0.0F, 1.0F, 0.0F);

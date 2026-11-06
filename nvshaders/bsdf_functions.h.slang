@@ -276,6 +276,32 @@ bool isRetroreflectionLobe(int lobe)
   return lobe == LOBE_DIFFUSE_REFLECTION || lobe == LOBE_SPECULAR_REFLECTION || lobe == LOBE_METAL_REFLECTION;
 }
 
+/*-------------------------------------------------------------------------------------------------
+# Function `bsdfFaceAllows`
+> Whether a direction `k2` leaves on the side of the face its event says: a reflection on the face
+> normal's side (Ng faces the view, or the side a walk's exit leaves by), a transmission across it
+> (Falcor's isValidHemisphereReflection / Transmission). The lobes test directions against the shading
+> normal alone, so a normal or detail map tilted past the face sent reflections through it: bounce
+> light leaked through thin cloth and lash sheets, and back into a body from its walk's exits. The
+> sampler drops such a sample and the pdf leaves it out, so the pdf stays the density the sampler draws
+> by. Evaluation keeps the light: next-event estimation reaches it on purpose (the terminator offset),
+> and with no BSDF sample to share it, its MIS weight is 1. Always true with `faceSided` off.
+-------------------------------------------------------------------------------------------------*/
+bool bsdfFaceAllows(PbrMaterial mat, float3 k2, bool transmission)
+{
+  if(!mat.faceSided)
+    return true;
+  const float side = dot(k2, mat.Ng);
+  return transmission ? side < 0.0F : side > 0.0F;
+}
+
+// Whether `lobe` scatters toward `k2` by transmission: the transmission lobes, the BTDF only below the
+// normal it splits reflection from refraction by (btdf_ggx_smith_eval)
+bool bsdfLobeTransmits(PbrMaterial mat, int lobe, float3 k2)
+{
+  return lobe == LOBE_DIFFUSE_TRANSMISSION || (lobe == LOBE_SPECULAR_TRANSMISSION && dot(k2, mat.N) < 0.0F);
+}
+
 // The Fresnel factor depends on the cosine between the view vector k1 and the
 // half vector, H = normalize(k1 + k2). But during sampling, we don't have k2
 // until we sample a microfacet. So instead, we approximate it.
@@ -1653,6 +1679,8 @@ int bsdfEvaluateCore(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial ma
   ARRAY_TYPE(float, LOBE_COUNT, p) = bsdfLobePick(mat, s, tint);
   const int lobe                   = lobeFromWeights(p, data.xi.z);
   bsdfEvaluateLobe(data, mat, lobe, tint);
+  if(!bsdfFaceAllows(mat, data.k2, bsdfLobeTransmits(mat, lobe, data.k2)))
+    data.pdf = 0.0F;  // its sampler never leaves this way: the light is next-event estimation's alone
 
   // Occlusion effect (glTF occlusion texture): the bsdf, never the pdf
   const float share = bsdfPickShare(s, p, lobe);
@@ -1728,6 +1756,14 @@ void bsdfEvaluateLobeBlended(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMat
   }
 }
 
+// Whether an evaluation gives anything toward its k2: a value, or a pdf. Not the pdf alone, which is 0
+// where light reaches a lobe its sampler never leaves by (bsdfFaceAllows).
+bool bsdfEvaluated(BsdfEvaluateData d)
+{
+  const float3 v = d.bsdf_diffuse + d.bsdf_glossy;  // never negative
+  return d.pdf > 0.0F || max(v.x, max(v.y, v.z)) > 0.0F;
+}
+
 // True when value and pdf are finite numbers.
 bool bsdfLobeFinite(BsdfEvaluateData d)
 {
@@ -1735,10 +1771,10 @@ bool bsdfLobeFinite(BsdfEvaluateData d)
            || any(isnan(d.bsdf_glossy)) || any(isinf(d.bsdf_glossy)));
 }
 
-// Adds s * lobe(at.k1, at.k2) to acc's value and p * its pdf to acc's pdf. A lobe with s <= 0, a
-// non-finite value or pdf, or pdf <= 0 adds nothing -- on both MIS sides alike, since both call this.
-// Returns false only when `lobe` is `sampledLobe` and was dropped: that BSDF sample has no light-sample
-// partner.
+// Adds s * lobe(at.k1, at.k2) to acc's value and p * its pdf to acc's pdf, the pdf only where the
+// sampler leaves by (bsdfFaceAllows). A lobe with s <= 0, a non-finite value or pdf, or pdf <= 0 adds
+// nothing -- on both MIS sides alike, since both call this. Returns false only when `lobe` is
+// `sampledLobe` and was dropped: that BSDF sample has no light-sample partner.
 bool bsdfAccumulateLobe(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) acc, BsdfEvaluateData at, PbrMaterial mat, int lobe, float s, float p, float3 tint, int sampledLobe)
 {
   if(!(s > 0.0f))  // zero-weight lobes cost one compare
@@ -1752,7 +1788,8 @@ bool bsdfAccumulateLobe(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) acc, BsdfEvaluate
     return lobe != sampledLobe;
   acc.bsdf_diffuse += s * d.bsdf_diffuse;
   acc.bsdf_glossy += s * d.bsdf_glossy;
-  acc.pdf += p * d.pdf;
+  if(bsdfFaceAllows(mat, at.k2, bsdfLobeTransmits(mat, lobe, at.k2)))
+    acc.pdf += p * d.pdf;
   return true;
 }
 
@@ -1928,6 +1965,13 @@ int bsdfSampleCore(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat, b
   }
   bsdfSampleLobe(data, mat, lobe, tint);
   data.bsdf_over_pdf *= bsdfPickShare(s, P, lobe);  // picked by P, weighed by s (an impulse too)
+  // Leaving on the wrong side of the face, it would start behind it (bsdfFaceAllows): dropped
+  if(data.event_type != BSDF_EVENT_ABSORB && !bsdfFaceAllows(mat, data.k2, (data.event_type & BSDF_EVENT_TRANSMISSION) != 0))
+  {
+    data.event_type    = BSDF_EVENT_ABSORB;
+    data.bsdf_over_pdf = float3(0.0F);
+    data.pdf           = 0.0F;
+  }
   data.k1 = k1;
   data.xi = xi;
   if(data.event_type == BSDF_EVENT_ABSORB || data.pdf == DIRAC)
