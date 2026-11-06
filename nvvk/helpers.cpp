@@ -19,6 +19,7 @@
 
 #include <array>
 #include <filesystem>
+#include <fstream>
 #include <tuple>
 
 // Makes stb_image_write take UTF-8 strings instead of the default code page as input on Windows
@@ -201,6 +202,24 @@ VkResult nvvk::saveImageToFile(VkDevice                     device,
     copyImageData(pixels, 4 * sizeof(float));
     writeResult = stbi_write_hdr(filenameUtf8.c_str(), size.width, size.height, 4, pixels.data());
   }
+  else if(nvutils::extensionMatches(filename, ".pfm"))
+  {
+    // Portable float map: the image's own 32-bit floats, RGB, little-endian, the bottom row first. Where
+    // .hdr's shared exponent keeps 8 bits a channel, this keeps every bit (a bit-exact comparison).
+    std::vector<float> pixels(size.width * size.height * 4);
+    copyImageData(pixels, 4 * sizeof(float));
+    std::ofstream out(filename, std::ios::binary);
+    out << "PF\n" << size.width << " " << size.height << "\n-1.0\n";
+    std::vector<float> row(size.width * 3);
+    for(uint32_t y = size.height; y-- > 0;)
+    {
+      for(uint32_t x = 0; x < size.width; x++)
+        for(int c = 0; c < 3; c++)
+          row[x * 3 + c] = pixels[(size_t(y) * size.width + x) * 4 + c];
+      out.write(reinterpret_cast<const char*>(row.data()), std::streamsize(row.size() * sizeof(float)));
+    }
+    writeResult = out.good() ? 1 : 0;
+  }
   else
   {
     LOGW("Screenshot: unknown file extension, saving as PNG\n");
@@ -284,7 +303,9 @@ VkResult nvvk::saveImageToFile(VkDevice                     device,
                                int                          quality,
                                VkImageLayout                srcLayout)
 {
-  const VkFormat dstFormat = nvutils::extensionMatches(filename, ".hdr") ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+  const VkFormat dstFormat = nvutils::extensionMatches(filename, ".hdr") || nvutils::extensionMatches(filename, ".pfm") ?
+                                 VK_FORMAT_R32G32B32A32_SFLOAT :
+                                 VK_FORMAT_R8G8B8A8_UNORM;
   VkImage        dstImage{};
   VkDeviceMemory dstImageMemory{};
   VkResult result = imageToLinearBlocking(device, physicalDevice, cmdPool, queue, srcImage, size, dstFormat, srcLayout,
