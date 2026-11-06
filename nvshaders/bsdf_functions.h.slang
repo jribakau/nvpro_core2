@@ -317,6 +317,20 @@ float fresnelCosineApproximation(float VdotN, float roughness)
 #define BSDF_FRESNEL_NONE 0        // not at all: the lobe weights carry it
 #define BSDF_FRESNEL_DIELECTRIC 1  // ior_fresnel(eta, k1.h), the exact dielectric's
 #define BSDF_FRESNEL_SCHLICK 2     // Schlick's from the tint (a metal's base colour) to white at k1.h
+#define BSDF_FRESNEL_PLATE 3       // plate_fresnel(eta, k1.h): a thin pane's two faces (bsdfIsPlate)
+
+// Whether a material's dielectric lobes reflect as a thin pane, both faces (PbrMaterial::plate): a
+// thin-walled surface only, since a medium's wall is one interface.
+bool bsdfIsPlate(PbrMaterial mat)
+{
+  return mat.plate && mat.thickness == 0.0F;
+}
+
+// One face's Fresnel, or a pane's two (bsdfIsPlate), for a microfacet at `kh`
+float bsdfDielectricFresnel(PbrMaterial mat, float eta, float kh)
+{
+  return bsdfIsPlate(mat) ? plate_fresnel(eta, kh) : ior_fresnel(eta, kh);
+}
 
 /*-------------------------------------------------------------------------------------------------
 # Function `ggxAlbedoScaleBias`
@@ -398,13 +412,30 @@ float ggxDielectricAlbedo(float eta, float alpha, float NoV)
   return clamp(f0 * sb.x + sb.y + (ior_fresnel(eta, cosine) - schlick) * (sb.x + sb.y), 0.0F, 1.0F);
 }
 
+// The albedo of a lobe weighing its microfacets by a thin pane's Fresnel (BSDF_FRESNEL_PLATE), as
+// ggxDielectricAlbedo's: Schlick's from the pane's head-on reflectance 2 f0 / (1 + f0), moved by how far
+// that is from the pane's own Fresnel at the view's typical microfacet.
+float ggxPlateAlbedo(float eta, float alpha, float NoV)
+{
+  const float2 sb      = ggxAlbedoScaleBias(alpha, NoV);
+  const float  f0      = dielectricF0(eta);
+  const float  p0      = 2.0F * f0 / (1.0F + f0);
+  const float  cosine  = fresnelCosineApproximation(clamp(NoV, 0.0F, 1.0F), alpha);
+  const float  m       = 1.0F - cosine;
+  const float  schlick = p0 + (1.0F - p0) * m * m * m * m * m;
+  return clamp(p0 * sb.x + sb.y + (plate_fresnel(eta, cosine) - schlick) * (sb.x + sb.y), 0.0F, 1.0F);
+}
+
 // The share of the light at view cosine `VdotN` the dielectric specular lobe reflects
-// (bsdfFresnelInLobes): specular, its colour's largest channel, and the lobe's albedo
+// (bsdfFresnelInLobes): specular, its colour's largest channel, and the lobe's albedo, a pane's
+// two faces where it is one (bsdfIsPlate)
 float bsdfSpecularAlbedo(PbrMaterial mat, float VdotN)
 {
   const float colour = min(max(mat.specularColor.x, max(mat.specularColor.y, mat.specularColor.z)), 1.0F);
   const float alpha  = 0.5F * (mat.roughness.x + mat.roughness.y);
-  return clamp(mat.specular * colour * ggxDielectricAlbedo(mat.ior2 / mat.ior1, alpha, VdotN), 0.0F, 1.0F);
+  const float eta    = mat.ior2 / mat.ior1;
+  const float albedo = bsdfIsPlate(mat) ? ggxPlateAlbedo(eta, alpha, VdotN) : ggxDielectricAlbedo(eta, alpha, VdotN);
+  return clamp(mat.specular * colour * albedo, 0.0F, 1.0F);
 }
 
 // The clearcoat's, likewise: its index 1.5 against ior1, its own roughness
@@ -572,7 +603,7 @@ ARRAY_TYPE(float, LOBE_COUNT, ) computeLobeWeights(PbrMaterial mat, float VdotN,
     else
     {
       float frCosineDielectric = fresnelCosineApproximation(VdotN, (mat.roughness.x + mat.roughness.y) * 0.5F);
-      frDielectric             = ior_fresnel(mat.ior2 / mat.ior1, frCosineDielectric);
+      frDielectric             = bsdfDielectricFresnel(mat, mat.ior2 / mat.ior1, frCosineDielectric);
       frDielectric *= mat.specular;
     }
   }
@@ -922,6 +953,8 @@ float3 bsdfMicrofacetFresnel(int fresnel, float eta, float3 tint, float k1h)
 {
   if(fresnel == BSDF_FRESNEL_DIELECTRIC)
     return tint * ior_fresnel(eta, k1h);
+  if(fresnel == BSDF_FRESNEL_PLATE)
+    return tint * plate_fresnel(eta, k1h);
   if(fresnel == BSDF_FRESNEL_SCHLICK)
     return schlickFresnel(tint, float3(1.0F), k1h);
   return tint;
@@ -1215,7 +1248,12 @@ void btdf_ggx_smith_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMateria
   // Invalid for reflection / refraction?
   const float nh  = dot(mat.N, h);
   const float k1h = dot(data.k1, h);
-  const float k2h = dot(data.k2, h) * (backside ? -1.0f : 1.0f);
+  // Thin-walled transmission is a reflection mirrored through the surface (btdf_ggx_smith_sample), so
+  // its angle to the microfacet is the mirrored direction's, which is k1h's. Read off the unmirrored
+  // direction, it was negative wherever the light left at a grazing angle to a tilted microfacet: those
+  // directions evaluated to nothing though the sampler sent bounces there, and a light behind rough
+  // thin glass lost that share of its light samples.
+  const float k2h = (isThinWalled && backside) ? dot(data.k2 + (2.0f * nk2) * mat.N, h) : dot(data.k2, h) * (backside ? -1.0f : 1.0f);
 
   // nk1 and nh must not be 0.0f or state.pdf == NaN.
   if(nk1 <= 0.0f || nh <= 0.0f || k1h < 0.0f || k2h < 0.0f)
@@ -1277,7 +1315,7 @@ void btdf_ggx_smith_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMateria
   data.pdf *= prob * G1;
 
   if(backside)
-    tint *= max(float3(1.0F) - reflected * ior_fresnel(ior.y / ior.x, k1h), float3(0.0F));
+    tint *= max(float3(1.0F) - reflected * bsdfDielectricFresnel(mat, ior.y / ior.x, k1h), float3(0.0F));
 
   // eval output: (glossy part of the) bsdf * dot(k2, normal)
   data.bsdf_glossy = bsdf * tint;
@@ -1388,7 +1426,7 @@ void btdf_ggx_smith_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMateria
   }
 
   if(data.event_type == BSDF_EVENT_GLOSSY_TRANSMISSION)
-    tint *= max(float3(1.0F) - reflected * ior_fresnel(ior.y / ior.x, kh), float3(0.0F));
+    tint *= max(float3(1.0F) - reflected * bsdfDielectricFresnel(mat, ior.y / ior.x, kh), float3(0.0F));
 
   data.bsdf_over_pdf *= tint;
 }
@@ -1553,7 +1591,7 @@ struct BsdfLobeFresnel
 {
   float3 tint;
   int    fresnel;    // BSDF_FRESNEL_*, for the reflection lobes
-  float  eta;        // for BSDF_FRESNEL_DIELECTRIC
+  float  eta;        // for BSDF_FRESNEL_DIELECTRIC and _PLATE
   float3 reflected;  // the transmission lobe's: what each microfacet's reflection takes from it
 };
 
@@ -1570,7 +1608,7 @@ BsdfLobeFresnel bsdfLobeFresnel(PbrMaterial mat, int lobe, float VdotN, float3 t
     if(bsdfFresnelInLobes(mat))
     {
       f.tint    = mat.specularColor * (mat.specular / max(bsdfSpecularAlbedo(mat, VdotN), 1e-6F));
-      f.fresnel = BSDF_FRESNEL_DIELECTRIC;
+      f.fresnel = bsdfIsPlate(mat) ? BSDF_FRESNEL_PLATE : BSDF_FRESNEL_DIELECTRIC;
       f.eta     = mat.ior2 / mat.ior1;
     }
   }

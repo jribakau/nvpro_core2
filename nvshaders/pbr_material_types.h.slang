@@ -63,6 +63,9 @@ struct PbrMaterial
   // thin-walled mode of KHR_materials_scatter needs the transmission lobe and the diffuse
   // reflection lobe to carry different colors, and `baseColor` alone can only express one.
   float3 transmissionTint;
+  // A thin-walled surface that is a pane: both its faces reflect (plate_fresnel), not one interface.
+  // Only with thickness 0 (bsdfIsPlate).
+  bool plate;
 
   float3 attenuationColor;     // KHR_materials_volume
   float  attenuationDistance;  //
@@ -123,6 +126,7 @@ PbrMaterial defaultPbrMaterial()
   mat.specularColor    = float3(1.0F);
   mat.transmission     = 0.0F;
   mat.transmissionTint = float3(1.0F);
+  mat.plate            = false;
 
   mat.attenuationColor    = float3(1.0F);
   mat.attenuationDistance = 1.0F;

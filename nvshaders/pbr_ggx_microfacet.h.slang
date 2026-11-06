@@ -389,6 +389,28 @@ float ior_fresnel(const float eta,  // refracted / reflected ior
   return clamp(fres, 0.0f, 1.0f);
 }
 
+// What a thin plate of index ratio `eta` reflects: both its faces, the light between them going back
+// and forth (incoherently, so no interference), per polarisation 2r / (1 + r) of one face's r, then
+// averaged. A pane of glass reflects 7.7% head-on where one face reflects 4%, and transmits
+// (1 - r) / (1 + r) of each polarisation. `kh` as ior_fresnel's; 1 past total internal reflection.
+float plate_fresnel(const float eta, const float kh)
+{
+  float costheta = 1.0f - (1.0f - kh * kh) / (eta * eta);
+  if(costheta <= 0.0f)
+  {
+    return 1.0f;
+  }
+  costheta = sqrt(costheta);
+
+  const float r_p  = (costheta - kh * eta) / (costheta + kh * eta);
+  const float r_o  = (kh - costheta * eta) / (kh + costheta * eta);
+  const float rp2  = r_p * r_p;
+  const float ro2  = r_o * r_o;
+  const float fres = rp2 / (1.0f + rp2) + ro2 / (1.0f + ro2);
+
+  return clamp(fres, 0.0f, 1.0f);
+}
+
 /*-------------------------------------------------------------------------------------------------
 # Function `hvd_sheen_eval`
 > Evaluates the anisotropic sheen half-vector distribution on the non-projected hemisphere.
