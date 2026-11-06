@@ -272,12 +272,19 @@ inline float3 cie1931XyzFromCie1960UV(float2 uv)
 # Advanced Color Grading Functions
 -------------------------------------------------------------------------------------------------*/
 
-// Saturation: linearly scales colors away from the closest grayscale value.
+// Saturation: scales colors away from the gray of the same luminance, in linear light. `color` is
+// sRGB-encoded, as the SDR grading takes it, and so is the result. BT.709's weights are for linear
+// values: on encoded ones they make saturated colours too dark a gray (pure red 0.21 instead of
+// 0.50, https://30fps.net/pages/better-srgb-to-greyscale/), and a scale there changes the
+// luminance as well. Here every saturation keeps it, up to where a channel would go below 0.
 // sat > 1 increases saturation, sat = 1 applies no change, sat = 0 converts to grayscale.
 inline float3 adjustSaturation(float3 color, float sat)
 {
-  float lum = luminance(color);
-  return lerp(float3(lum), color, float3(sat));
+  if(sat == 1.0F)
+    return color;
+  const float3 lin = toLinear(color);
+  const float  lum = luminance(lin);
+  return toSrgb(max(lerp(float3(lum), lin, float3(sat)), float3(0.0F)));
 }
 
 // Vibrance: Boosts saturation of desaturated colors while preserving already-saturated colors.
