@@ -102,6 +102,7 @@ and a V-cavity shadowing-masking function).
 #include "functions.h.slang"           // cosineSampleHemisphere
 #include "pbr_ggx_microfacet.h.slang"  // brdfLambertian, ..
 #include "ggx_albedo_table.h.slang"
+#include "sheen_albedo_table.h.slang"
 #include "bsdf_types.h.slang"
 #include "pbr_material_types.h.slang"
 
@@ -400,6 +401,42 @@ float bsdfSpecular2Albedo(PbrMaterial mat, float VdotN)
 }
 
 /*-------------------------------------------------------------------------------------------------
+# Function `sheenAlbedo`
+> The directional albedo of the sheen lobe below (brdf_sheen_sample) with a white colour, at
+> perceptual sheen roughness `roughness` and view cosine `NoV`: the baked table
+> (sheen_albedo_table.h.slang), bilinear in sqrt(roughness) and sqrt(NoV).
+-------------------------------------------------------------------------------------------------*/
+float sheenAlbedo(float roughness, float NoV)
+{
+  const int   last = SHEEN_ALBEDO_TABLE_RES - 1;
+  const float x    = sqrt(clamp(roughness, 0.0F, 1.0F)) * float(last);
+  const float y    = sqrt(clamp(NoV, 0.0F, 1.0F)) * float(last);
+  const int   i    = min(int(x), last - 1);
+  const int   j    = min(int(y), last - 1);
+  const float fx   = x - float(i);
+  const float fy   = y - float(j);
+  const int   k    = i * SHEEN_ALBEDO_TABLE_RES + j;
+  const int   kx   = k + SHEEN_ALBEDO_TABLE_RES;  // the next roughness
+  const float e0   = SHEEN_ALBEDO[k] + (SHEEN_ALBEDO[kx] - SHEEN_ALBEDO[k]) * fx;
+  const float e1   = SHEEN_ALBEDO[k + 1] + (SHEEN_ALBEDO[kx + 1] - SHEEN_ALBEDO[k + 1]) * fx;
+  return e0 + (e1 - e0) * fy;
+}
+
+// What the sheen layer reflects of the light at view cosine `VdotN`, and so takes from the layers below
+// (KHR_materials_sheen's albedo scaling): its colour's largest channel times the lobe's albedo. A faint
+// sheen takes little; the lobe's value is divided by it (bsdfSheenScale), as the specular lobes' are.
+float bsdfSheenAlbedo(PbrMaterial mat, float VdotN)
+{
+  const float colour = max(mat.sheenColor.x, max(mat.sheenColor.y, mat.sheenColor.z));
+  return clamp(colour * sheenAlbedo(mat.sheenRoughness, abs(VdotN)), 0.0F, 1.0F);
+}
+
+float bsdfSheenScale(PbrMaterial mat, float VdotN)
+{
+  return 1.0F / max(bsdfSheenAlbedo(mat, VdotN), 1e-6F);
+}
+
+/*-------------------------------------------------------------------------------------------------
 # Function `bsdfCoatDarkening`
 > What a coat takes from the base under it, past what it reflects at the view: light the coat reflects
 > back inside meets the base again, and a dark base absorbs it, so a coated dark surface looks deeper.
@@ -527,11 +564,12 @@ ARRAY_TYPE(float, LOBE_COUNT, ) computeLobeWeights(PbrMaterial mat, float VdotN,
     tint = mix_rgb(tint, mat.specularColor, frIridescence * mat.iridescence);
   }
 
+  // What the sheen reflects: the layers below get the rest. It once charged them by the view and
+  // roughness alone, so a faint sheen took half the base at ordinary views (M47).
   float sheen = 0.0f;
   if((mat.sheenColor.r != 0.0F || mat.sheenColor.g != 0.0F || mat.sheenColor.b != 0.0F))
   {
-    sheen = pow(1.0f - abs(VdotN), mat.sheenRoughness);  // * luminance(mat.sheenColor);
-    sheen = sheen / (sheen + 0.5F);
+    sheen = bsdfSheenAlbedo(mat, VdotN);
   }
 
   /*
@@ -565,7 +603,7 @@ ARRAY_TYPE(float, LOBE_COUNT, ) computeLobeWeights(PbrMaterial mat, float VdotN,
   weightLobe[LOBE_SPECULAR2_REFLECTION] = weightBase * frSpecular2;  // BRDF second specular (GGX-Smith)
   weightBase *= 1.0f - frSpecular2;
 
-  weightLobe[LOBE_SHEEN_REFLECTION] = weightBase * sheen;  // BRDF sheen reflection (Lambert)
+  weightLobe[LOBE_SHEEN_REFLECTION] = weightBase * sheen;  // BRDF sheen reflection (Charlie, v-cavities)
   weightBase *= 1.0f - sheen;
 
   weightLobe[LOBE_METAL_REFLECTION] = weightBase * mat.metallic;  // BRDF metal (GGX-Smith)
@@ -583,8 +621,8 @@ ARRAY_TYPE(float, LOBE_COUNT, ) computeLobeWeights(PbrMaterial mat, float VdotN,
   return weightLobe;
 }
 
-// findLobe's selection, from weights already computed: walks from the last lobe down and returns lobe 0
-// when nothing else was picked. findLobe = computeLobeWeights + this (bit-identical to before).
+// A lobe chosen with the probabilities `weightLobe` (bsdfLobePick's): walks from the last lobe down and
+// returns lobe 0 when nothing else was picked.
 int lobeFromWeights(ARRAY_TYPE(float, LOBE_COUNT, weightLobe), float rndVal)
 {
   int   lobe   = LOBE_COUNT;
@@ -604,14 +642,58 @@ int lobeFromWeights(ARRAY_TYPE(float, LOBE_COUNT, weightLobe), float rndVal)
 }
 
 /*-------------------------------------------------------------------------------------------------
-# Function `findLobe`
-> Calculates the weights of the individual lobes inside the standard PBR material
-> and randomly selects one.
+# Function `bsdfLobePick`
+> How often each lobe is sampled, apart from what it weighs (`s`, computeLobeWeights'): by the light it
+> returns, s_j a_j, with a_j the share of the light reaching the lobe that its own value gives back
+> (Falcor's StandardBSDF picks so). A dark base under a specular or a coat then stops taking nearly
+> every sample for a lobe that returns a few percent of the light: a 0.04 base under its specular
+> picked the specular 5% of the time, now about 57%. Each pick is at least a tenth of its weight
+> (renormalized), so a sample carries at most about 11 times its lobe's value (bsdfPickShare's s_j / P_j).
+> Sums to 1, as `s` does. `tint` is the one computeLobeWeights gave. Both MIS sides read it: the sampler
+> picks by it and reports its mixture pdf, sum_j P_j p_j (bsdfEvaluateSumWeighted).
 -------------------------------------------------------------------------------------------------*/
-int findLobe(PbrMaterial mat, float VdotN, float rndVal, NVSHADERS_INOUT_TYPE(float3) tint)
+ARRAY_TYPE(float, LOBE_COUNT, ) bsdfLobePick(PbrMaterial mat, ARRAY_TYPE(float, LOBE_COUNT, s), float3 tint)
 {
-  ARRAY_TYPE(float, LOBE_COUNT, weightLobe) = computeLobeWeights(mat, VdotN, tint);
-  return lobeFromWeights(weightLobe, rndVal);
+  // 1 for the lobes whose value is divided by their albedo (bsdfLobeFresnel, bsdfSheenScale) and for
+  // transmission, into glass or a medium's walk; the base colour's for the diffuse lobe and the metal
+  ARRAY_TYPE(float, LOBE_COUNT, a);
+  a[LOBE_DIFFUSE_REFLECTION]    = luminance(tint);
+  a[LOBE_SPECULAR_TRANSMISSION] = 1.0F;
+  a[LOBE_SPECULAR_REFLECTION]   = 1.0F;
+  a[LOBE_METAL_REFLECTION]      = s[LOBE_METAL_REFLECTION] > 0.0F ? luminance(mat.baseColor * bsdfUnderCoat(mat)) : 0.0F;
+  a[LOBE_SHEEN_REFLECTION]      = 1.0F;
+  a[LOBE_CLEARCOAT_REFLECTION]  = 1.0F;
+  a[LOBE_DIFFUSE_TRANSMISSION] =
+      s[LOBE_DIFFUSE_TRANSMISSION] > 0.0F ? luminance(mat.diffuseTransmissionColorFactor * bsdfUnderCoat(mat)) : 0.0F;
+  a[LOBE_SPECULAR2_REFLECTION] = 1.0F;
+
+  float carried = 0.0F;
+  for(int j = 0; j < LOBE_COUNT; j++)
+    carried += s[j] * clamp(a[j], 0.0F, 1.0F);
+  if(!(carried > 0.0F))
+    return s;  // nothing gives any light back: by weight
+
+  ARRAY_TYPE(float, LOBE_COUNT, p);
+  float total = 0.0F;
+  for(int j = 0; j < LOBE_COUNT; j++)
+  {
+    p[j] = max(s[j] * clamp(a[j], 0.0F, 1.0F) / carried, 0.1F * s[j]);
+    total += p[j];
+  }
+  for(int j = 0; j < LOBE_COUNT; j++)
+    p[j] /= total;
+  return p;
+}
+
+// What a sample of `lobe`, picked with probability p[lobe], carries for its weight s[lobe]: s / p (0 for a
+// lobe never picked). Constant indices only, so the arrays stay in registers.
+float bsdfPickShare(ARRAY_TYPE(float, LOBE_COUNT, s), ARRAY_TYPE(float, LOBE_COUNT, p), int lobe)
+{
+  float share = 0.0F;
+  for(int j = 0; j < LOBE_COUNT; j++)
+    if(j == lobe && p[j] > 0.0F)
+      share = s[j] / p[j];
+  return share;
 }
 
 /*
@@ -1554,23 +1636,28 @@ void bsdfEvaluateLobe(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial m
   else if(lobe == LOBE_SHEEN_REFLECTION)
   {
     brdf_sheen_eval(data, mat);
+    data.bsdf_glossy *= bsdfSheenScale(mat, dot(data.k1, mat.N));  // its weight carries its albedo
   }
 }
 
 /*-------------------------------------------------------------------------------------------------
 # Function `bsdfEvaluateCore`
 > Single-path BSDF evaluation (forward or retro view direction in `data.k1`).
-> Returns the stochastically selected lobe index.
+> Returns the stochastically selected lobe index: picked as bsdfSample picks (bsdfLobePick), its value
+> times what the pick carries for its weight, its own pdf.
 -------------------------------------------------------------------------------------------------*/
 int bsdfEvaluateCore(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat)
 {
-  float3    tint = mat.baseColor;
-  const int lobe = findLobe(mat, dot(data.k1, mat.N), data.xi.z, tint);
+  float3 tint = mat.baseColor;
+  ARRAY_TYPE(float, LOBE_COUNT, s) = computeLobeWeights(mat, dot(data.k1, mat.N), tint);
+  ARRAY_TYPE(float, LOBE_COUNT, p) = bsdfLobePick(mat, s, tint);
+  const int lobe                   = lobeFromWeights(p, data.xi.z);
   bsdfEvaluateLobe(data, mat, lobe, tint);
 
   // Occlusion effect (glTF occlusion texture): the bsdf, never the pdf
-  data.bsdf_diffuse *= mat.occlusion;
-  data.bsdf_glossy *= mat.occlusion;
+  const float share = bsdfPickShare(s, p, lobe);
+  data.bsdf_diffuse *= mat.occlusion * share;
+  data.bsdf_glossy *= mat.occlusion * share;
 
   return lobe;
 }
@@ -1648,10 +1735,11 @@ bool bsdfLobeFinite(BsdfEvaluateData d)
            || any(isnan(d.bsdf_glossy)) || any(isinf(d.bsdf_glossy)));
 }
 
-// Adds s * lobe(at.k1, at.k2) to acc. A lobe with s <= 0, a non-finite value or pdf, or pdf <= 0 adds
-// nothing -- on both MIS sides alike, since both call this. Returns false only when `lobe` is
-// `sampledLobe` and was dropped: that BSDF sample has no light-sample partner.
-bool bsdfAccumulateLobe(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) acc, BsdfEvaluateData at, PbrMaterial mat, int lobe, float s, float3 tint, int sampledLobe)
+// Adds s * lobe(at.k1, at.k2) to acc's value and p * its pdf to acc's pdf. A lobe with s <= 0, a
+// non-finite value or pdf, or pdf <= 0 adds nothing -- on both MIS sides alike, since both call this.
+// Returns false only when `lobe` is `sampledLobe` and was dropped: that BSDF sample has no light-sample
+// partner.
+bool bsdfAccumulateLobe(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) acc, BsdfEvaluateData at, PbrMaterial mat, int lobe, float s, float p, float3 tint, int sampledLobe)
 {
   if(!(s > 0.0f))  // zero-weight lobes cost one compare
     return lobe != sampledLobe;
@@ -1664,18 +1752,24 @@ bool bsdfAccumulateLobe(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) acc, BsdfEvaluate
     return lobe != sampledLobe;
   acc.bsdf_diffuse += s * d.bsdf_diffuse;
   acc.bsdf_glossy += s * d.bsdf_glossy;
-  acc.pdf += s * d.pdf;
+  acc.pdf += p * d.pdf;
   return true;
 }
 
 /*-------------------------------------------------------------------------------------------------
 # Function `bsdfEvaluateSumWeighted`
-> The whole BSDF at (k1, k2) for lobe weights `s` and `tint` that computeLobeWeights gave at k1:
-> bsdf_diffuse/bsdf_glossy = occlusion * sum_j s_j g_j (the mean of bsdfEvaluate over xi.z) and
-> pdf = q = sum_j s_j p_j. xi.z only picks the dispersion wavelength. Returns false if `sampledLobe`
-> (>= 0) was dropped. Lobes are listed with constant indices so the weight array stays in registers.
+> The whole BSDF at (k1, k2) for lobe weights `s` and `tint` that computeLobeWeights gave at k1, and
+> the lobe pick `P` bsdfLobePick gave from them: bsdf_diffuse/bsdf_glossy = occlusion * sum_j s_j g_j
+> (the mean of bsdfEvaluate over xi.z) and pdf = q = sum_j P_j p_j, the density bsdfSample draws by.
+> xi.z only picks the dispersion wavelength. Returns false if `sampledLobe` (>= 0) was dropped. Lobes
+> are listed with constant indices so the weight arrays stay in registers.
 -------------------------------------------------------------------------------------------------*/
-bool bsdfEvaluateSumWeighted(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat, ARRAY_TYPE(float, LOBE_COUNT, s), float3 tint, int sampledLobe)
+bool bsdfEvaluateSumWeighted(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data,
+                             PbrMaterial                           mat,
+                             ARRAY_TYPE(float, LOBE_COUNT, s),
+                             ARRAY_TYPE(float, LOBE_COUNT, P),
+                             float3 tint,
+                             int    sampledLobe)
 {
   BsdfEvaluateData acc;
   acc.k1           = data.k1;
@@ -1685,14 +1779,14 @@ bool bsdfEvaluateSumWeighted(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMat
   acc.bsdf_glossy  = float3(0.0f);
   acc.pdf          = 0.0f;
   bool covered     = true;
-  covered = bsdfAccumulateLobe(acc, data, mat, LOBE_CLEARCOAT_REFLECTION, s[LOBE_CLEARCOAT_REFLECTION], tint, sampledLobe) && covered;
-  covered = bsdfAccumulateLobe(acc, data, mat, LOBE_SPECULAR2_REFLECTION, s[LOBE_SPECULAR2_REFLECTION], tint, sampledLobe) && covered;
-  covered = bsdfAccumulateLobe(acc, data, mat, LOBE_SHEEN_REFLECTION, s[LOBE_SHEEN_REFLECTION], tint, sampledLobe) && covered;
-  covered = bsdfAccumulateLobe(acc, data, mat, LOBE_METAL_REFLECTION, s[LOBE_METAL_REFLECTION], tint, sampledLobe) && covered;
-  covered = bsdfAccumulateLobe(acc, data, mat, LOBE_SPECULAR_REFLECTION, s[LOBE_SPECULAR_REFLECTION], tint, sampledLobe) && covered;
-  covered = bsdfAccumulateLobe(acc, data, mat, LOBE_SPECULAR_TRANSMISSION, s[LOBE_SPECULAR_TRANSMISSION], tint, sampledLobe) && covered;
-  covered = bsdfAccumulateLobe(acc, data, mat, LOBE_DIFFUSE_TRANSMISSION, s[LOBE_DIFFUSE_TRANSMISSION], tint, sampledLobe) && covered;
-  covered = bsdfAccumulateLobe(acc, data, mat, LOBE_DIFFUSE_REFLECTION, s[LOBE_DIFFUSE_REFLECTION], tint, sampledLobe) && covered;
+  covered = bsdfAccumulateLobe(acc, data, mat, LOBE_CLEARCOAT_REFLECTION, s[LOBE_CLEARCOAT_REFLECTION], P[LOBE_CLEARCOAT_REFLECTION], tint, sampledLobe) && covered;
+  covered = bsdfAccumulateLobe(acc, data, mat, LOBE_SPECULAR2_REFLECTION, s[LOBE_SPECULAR2_REFLECTION], P[LOBE_SPECULAR2_REFLECTION], tint, sampledLobe) && covered;
+  covered = bsdfAccumulateLobe(acc, data, mat, LOBE_SHEEN_REFLECTION, s[LOBE_SHEEN_REFLECTION], P[LOBE_SHEEN_REFLECTION], tint, sampledLobe) && covered;
+  covered = bsdfAccumulateLobe(acc, data, mat, LOBE_METAL_REFLECTION, s[LOBE_METAL_REFLECTION], P[LOBE_METAL_REFLECTION], tint, sampledLobe) && covered;
+  covered = bsdfAccumulateLobe(acc, data, mat, LOBE_SPECULAR_REFLECTION, s[LOBE_SPECULAR_REFLECTION], P[LOBE_SPECULAR_REFLECTION], tint, sampledLobe) && covered;
+  covered = bsdfAccumulateLobe(acc, data, mat, LOBE_SPECULAR_TRANSMISSION, s[LOBE_SPECULAR_TRANSMISSION], P[LOBE_SPECULAR_TRANSMISSION], tint, sampledLobe) && covered;
+  covered = bsdfAccumulateLobe(acc, data, mat, LOBE_DIFFUSE_TRANSMISSION, s[LOBE_DIFFUSE_TRANSMISSION], P[LOBE_DIFFUSE_TRANSMISSION], tint, sampledLobe) && covered;
+  covered = bsdfAccumulateLobe(acc, data, mat, LOBE_DIFFUSE_REFLECTION, s[LOBE_DIFFUSE_REFLECTION], P[LOBE_DIFFUSE_REFLECTION], tint, sampledLobe) && covered;
   // Occlusion effect (glTF occlusion texture): the bsdf, never the pdf
   data.bsdf_diffuse = acc.bsdf_diffuse * mat.occlusion;
   data.bsdf_glossy  = acc.bsdf_glossy * mat.occlusion;
@@ -1705,7 +1799,8 @@ bool bsdfEvaluateSum(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial ma
 {
   float3 tint = mat.baseColor;
   ARRAY_TYPE(float, LOBE_COUNT, s) = computeLobeWeights(mat, dot(data.k1, mat.N), tint);
-  return bsdfEvaluateSumWeighted(data, mat, s, tint, sampledLobe);
+  ARRAY_TYPE(float, LOBE_COUNT, P) = bsdfLobePick(mat, s, tint);
+  return bsdfEvaluateSumWeighted(data, mat, s, P, tint, sampledLobe);
 }
 
 /*-------------------------------------------------------------------------------------------------
@@ -1767,6 +1862,7 @@ void bsdfSampleLobe(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat, 
     // Sheen is using the state.sheenColor and state.sheenInvRoughness values directly.
     // Only brdf_sheen_sample needs a third random sample for the v-cavities flip. Put this as argument.
     brdf_sheen_sample(data, mat);
+    data.bsdf_over_pdf *= bsdfSheenScale(mat, dot(data.k1, mat.N));  // its weight carries its albedo
   }
 
   // Avoid internal reflection
@@ -1820,7 +1916,8 @@ int bsdfSampleCore(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat, b
   const float3 xi   = data.xi;
   float3       tint = mat.baseColor;
   ARRAY_TYPE(float, LOBE_COUNT, s) = computeLobeWeights(mat, dot(k1, mat.N), tint);
-  const int lobe = lobeFromWeights(s, xi.z);
+  ARRAY_TYPE(float, LOBE_COUNT, P) = bsdfLobePick(mat, s, tint);
+  const int lobe                   = lobeFromWeights(P, xi.z);
 
   const float blend    = mat.retroreflection;
   const bool  hasRetro = blend > 0.0f && isRetroreflectionLobe(lobe);
@@ -1830,6 +1927,7 @@ int bsdfSampleCore(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat, b
     bsdfSampleRetroreflectionPath(data, mat, blend);  // picks a path with probability = its blend weight; may mirror k1
   }
   bsdfSampleLobe(data, mat, lobe, tint);
+  data.bsdf_over_pdf *= bsdfPickShare(s, P, lobe);  // picked by P, weighed by s (an impulse too)
   data.k1 = k1;
   data.xi = xi;
   if(data.event_type == BSDF_EVENT_ABSORB || data.pdf == DIRAC)
@@ -1841,7 +1939,7 @@ int bsdfSampleCore(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat, b
   e.xi = xi;  // the original xi.z: a sampled transmission drew its wavelength from it (never the MRM path)
   if(mixturePdf)
   {
-    const bool covered = bsdfEvaluateSumWeighted(e, mat, s, tint, lobe);
+    const bool covered = bsdfEvaluateSumWeighted(e, mat, s, P, tint, lobe);
     data.pdf           = (covered && e.pdf > 0.0f) ? e.pdf : DIRAC;
   }
   else if(hasRetro)
