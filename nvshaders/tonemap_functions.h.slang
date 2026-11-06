@@ -370,12 +370,59 @@ inline float3x3 getColorCorrectionMatrix(float exposure, float temperature, floa
 // Applies the given tone mapper and color grading settings to a given color.
 // Requires the pixel index so it can dither,
 // and the screen size so that it can apply vignetting.
+/*-------------------------------------------------------------------------------------------------
+# Function `falseColorExposure`
+> The false-colour exposure view's colour for a pixel, sRGB-encoded as applyTonemap's result:
+> `luminance` is the exposed scene's (after exposure and white balance, what the curve takes), `shown`
+> the image's graded colour there. Whole stops around middle grey (0.18) in nine bands of inferno,
+> each a stop wide and centred on its stop (falseColorBand): -4 and below dark violet, 0 the middle
+> band's red, +4 and above pale yellow. Where the image clips (a channel at its top) green, where it
+> crushes (every channel under half an 8-bit step) blue, whatever the stop. The app's legend
+> (src/components/DisplayMenu.svelte) lists the same colours.
+-------------------------------------------------------------------------------------------------*/
+inline int falseColorBand(float luminance)
+{
+  const float stops = log2(max(luminance, 1e-12F) / 0.18F);
+  return int(clamp(floor(stops + 0.5F), -4.0F, 4.0F)) + 4;
+}
+
+inline float3 falseColorExposure(float luminance, float3 shown)
+{
+  const float top = max(shown.x, max(shown.y, shown.z));
+  if(top >= 254.5F / 255.F)
+    return float3(0.F, 255.F, 77.F) / 255.F;  // clipped
+  if(top < 0.5F / 255.F)
+    return float3(26.F, 115.F, 255.F) / 255.F;  // crushed
+  switch(falseColorBand(luminance))
+  {
+    case 0:
+      return float3(22.F, 11.F, 57.F) / 255.F;
+    case 1:
+      return float3(66.F, 10.F, 104.F) / 255.F;
+    case 2:
+      return float3(106.F, 23.F, 110.F) / 255.F;
+    case 3:
+      return float3(147.F, 38.F, 103.F) / 255.F;
+    case 4:
+      return float3(188.F, 55.F, 84.F) / 255.F;  // middle grey
+    case 5:
+      return float3(221.F, 81.F, 58.F) / 255.F;
+    case 6:
+      return float3(243.F, 120.F, 25.F) / 255.F;
+    case 7:
+      return float3(252.F, 165.F, 10.F) / 255.F;
+    default:
+      return float3(246.F, 215.F, 70.F) / 255.F;
+  }
+}
+
 inline float3 applyTonemap(TonemapperData tm, float3 color, float2 pixel, float2 imageSize)
 {
   // Exposure and white balance.
   // These are combined into a matrix and applied together before tonemapping
   // because they're correcting for scene lighting and camera parameters.
   color = mul(tm.inputMatrix, color);
+  const float exposed = luminance(color);  // the false-colour view's
 
   float3 c = color;
   // Tonemap
@@ -433,6 +480,10 @@ inline float3 applyTonemap(TonemapperData tm, float3 color, float2 pixel, float2
   // vignette
   float2 center_uv = (pixel / imageSize) * 2.0F - 1.0F;
   c *= 1.0F - dot(center_uv, center_uv) * tm.vignette;
+
+  // The exposure view: the stops of what the image shows, undithered
+  if(tm.falseColor != 0)
+    return falseColorExposure(exposed, c);
 
   // Dither assuming 8-bit output.
   if(tm.dither == 1)

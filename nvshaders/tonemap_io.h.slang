@@ -103,6 +103,8 @@ struct TonemapperData
   uint32_t averageMode          SLANG_DEFAULT(1);      // 0 = Mean, 1 = Median
   // Dither
   int dither SLANG_DEFAULT(1);  // 0: no dither, 1: dither
+  // 1: the false-colour exposure view (falseColorExposure) in place of the image
+  int falseColor SLANG_DEFAULT(0);
 };
 
 
