@@ -298,11 +298,13 @@ public:
   // The `srcLayout` must be the current imageLayout when this operation is executed.
   // The saving is done using a temporary command buffer on the primary queue and vkDeviceWaitIdle will
   // be called in advance.
+  // `opaque`: as nvvk::saveImageToFile's, an 8-bit file's alpha 1 everywhere
   VkResult saveImageToFile(VkImage                      srcImage,
                            VkExtent2D                   srcSize,
                            const std::filesystem::path& filename,
                            int                          quality   = 100,
-                           VkImageLayout                srcLayout = VK_IMAGE_LAYOUT_GENERAL);
+                           VkImageLayout                srcLayout = VK_IMAGE_LAYOUT_GENERAL,
+                           bool                         opaque    = false);
 
 
 protected:

@@ -1217,10 +1217,10 @@ void nvapp::Application::setupImGuiVulkanBackend(ImGuiConfigFlags configFlags)
 }
 
 
-VkResult nvapp::Application::saveImageToFile(VkImage srcImage, VkExtent2D srcSize, const std::filesystem::path& filename, int quality, VkImageLayout srcLayout)
+VkResult nvapp::Application::saveImageToFile(VkImage srcImage, VkExtent2D srcSize, const std::filesystem::path& filename, int quality, VkImageLayout srcLayout, bool opaque)
 {
   return nvvk::saveImageToFile(m_device, m_physicalDevice, m_transientCmdPool, m_queues[0].queue, srcImage, srcSize,
-                               filename, quality, srcLayout);
+                               filename, quality, srcLayout, opaque);
 }
 
 

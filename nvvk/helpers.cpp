@@ -153,7 +153,8 @@ VkResult nvvk::saveImageToFile(VkDevice                     device,
                                VkDeviceMemory               dstImageMemory,
                                VkExtent2D                   size,
                                const std::filesystem::path& filename,
-                               int                          quality /*= 100*/)
+                               int                          quality /*= 100*/,
+                               bool                         opaque /*= false*/)
 {
   // Get layout of the image (including offset and row pitch)
   VkImageSubresource  subResource{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
@@ -175,6 +176,12 @@ VkResult nvvk::saveImageToFile(VkDevice                     device,
       data += subResourceLayout.rowPitch;
     }
   };
+  // An 8-bit image's alpha set to 1 (`opaque`)
+  auto makeOpaque = [&](std::vector<uint8_t>& pixels8) {
+    if(opaque)
+      for(size_t i = 3; i < pixels8.size(); i += 4)
+        pixels8[i] = 255;
+  };
 
   // Check the extension and perform actions accordingly
   int writeResult = 0;
@@ -182,6 +189,7 @@ VkResult nvvk::saveImageToFile(VkDevice                     device,
   {
     std::vector<uint8_t> pixels8(size.width * size.height * 4);
     copyImageData(pixels8, 4 * sizeof(uint8_t));
+    makeOpaque(pixels8);
     writeResult = stbi_write_png(filenameUtf8.c_str(), size.width, size.height, 4, pixels8.data(), size.width * 4);
   }
   else if(nvutils::extensionMatches(filename, ".jpg") || nvutils::extensionMatches(filename, ".jpeg"))
@@ -194,6 +202,7 @@ VkResult nvvk::saveImageToFile(VkDevice                     device,
   {
     std::vector<uint8_t> pixels8(size.width * size.height * 4);
     copyImageData(pixels8, 4 * sizeof(uint8_t));
+    makeOpaque(pixels8);
     writeResult = stbi_write_bmp(filenameUtf8.c_str(), size.width, size.height, 4, pixels8.data());
   }
   else if(nvutils::extensionMatches(filename, ".hdr"))
@@ -228,6 +237,7 @@ VkResult nvvk::saveImageToFile(VkDevice                     device,
     filenameUtf8 = nvutils::utf8FromPath(path);
     std::vector<uint8_t> pixels8(size.width * size.height * 4);
     copyImageData(pixels8, 4 * sizeof(uint8_t));
+    makeOpaque(pixels8);
     writeResult = stbi_write_png(filenameUtf8.c_str(), size.width, size.height, 4, pixels8.data(), size.width * 4);
   }
 
@@ -301,7 +311,8 @@ VkResult nvvk::saveImageToFile(VkDevice                     device,
                                VkExtent2D                   size,
                                const std::filesystem::path& filename,
                                int                          quality,
-                               VkImageLayout                srcLayout)
+                               VkImageLayout                srcLayout,
+                               bool                         opaque)
 {
   const VkFormat dstFormat = nvutils::extensionMatches(filename, ".hdr") || nvutils::extensionMatches(filename, ".pfm") ?
                                  VK_FORMAT_R32G32B32A32_SFLOAT :
@@ -311,7 +322,7 @@ VkResult nvvk::saveImageToFile(VkDevice                     device,
   VkResult result = imageToLinearBlocking(device, physicalDevice, cmdPool, queue, srcImage, size, dstFormat, srcLayout,
                                           dstImage, dstImageMemory);
   if(result == VK_SUCCESS)
-    result = saveImageToFile(device, dstImage, dstImageMemory, size, filename, quality);
+    result = saveImageToFile(device, dstImage, dstImageMemory, size, filename, quality, opaque);
 
   destroyLinearImage(device, dstImage, dstImageMemory);
   return result;
