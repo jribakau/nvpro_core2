@@ -2180,6 +2180,23 @@ int bsdfSampleCore(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat, b
 }
 
 /*-------------------------------------------------------------------------------------------------
+# Function `bsdfLobeRoughness`
+> How rough a sample of `lobe` (the one `bsdfSampleCore` returns) is, perceptual: a glossy lobe's
+> own roughness (the base's larger anisotropic alpha for the specular, metal and transmission lobes),
+> 1 for the diffuse lobes and for sheen, which is broad at any roughness.
+-------------------------------------------------------------------------------------------------*/
+float bsdfLobeRoughness(PbrMaterial mat, int lobe)
+{
+  if(lobe == LOBE_CLEARCOAT_REFLECTION)
+    return mat.clearcoatRoughness;
+  if(lobe == LOBE_SPECULAR2_REFLECTION)
+    return mat.specular2Roughness;
+  if(lobe == LOBE_SPECULAR_REFLECTION || lobe == LOBE_METAL_REFLECTION || lobe == LOBE_SPECULAR_TRANSMISSION)
+    return sqrt(max(mat.roughness.x, mat.roughness.y));
+  return 1.0F;
+}
+
+/*-------------------------------------------------------------------------------------------------
 # Function `bsdfSample`
 
 > Samples the full BSDF model for the given material and input direction.
