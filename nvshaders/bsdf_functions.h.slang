@@ -1671,6 +1671,30 @@ PbrMaterial bsdfSpecular2Material(PbrMaterial mat)
   return mat;
 }
 
+// A thin-walled pane's colour seen at view cosine `cosI` (either side): the colour it is authored with is
+// a crossing's face-on, and the path through a slab lengthens as 1 / cos of the refracted angle, so
+// Beer-Lambert raises it to that power and a tinted pane deepens at a slant (Iray keeps a crossing's
+// colour whatever the angle). `eta`: the pane's index over its surroundings', either way round; at 1
+// the path would grow without bound toward grazing, so its cosine stops at THIN_TINT_COS_FLOOR. A
+// colourless pane stays colourless. Shared by the transmission lobe (bsdfLobeFresnel), the shadow
+// rays through thin glass and DLSS's see-through guides, which must agree.
+static const float THIN_TINT_COS_FLOOR = 0.1F;
+
+float3 bsdfThinTintAtSlant(float3 tint, float eta, float cosI)
+{
+  const float e     = max(eta, 1.0F / max(eta, 1e-6F));
+  const float sinT2 = (1.0F - cosI * cosI) / (e * e);
+  const float cosT  = max(sqrt(max(1.0F - sinT2, 0.0F)), THIN_TINT_COS_FLOOR);
+  return pow(max(tint, float3(0.0F)), float3(1.0F / cosT));
+}
+
+// Whether `mat`'s specular transmission is a pane's that bsdfThinTintAtSlant deepens: thin-walled, and
+// no thin scatter, whose transmissionTint cancels a colour blended for a medium (thin_scatter.h.slang).
+bool bsdfThinPaneTint(PbrMaterial mat)
+{
+  return mat.thickness == 0.0F && mat.transmissionTint.x == 1.0F && mat.transmissionTint.y == 1.0F && mat.transmissionTint.z == 1.0F;
+}
+
 /*-------------------------------------------------------------------------------------------------
 # Function `bsdfLobeFresnel`
 > How a reflection or transmission lobe carries its Fresnel, at view cosine `VdotN` (the one
@@ -1706,8 +1730,11 @@ BsdfLobeFresnel bsdfLobeFresnel(PbrMaterial mat, int lobe, float VdotN, float3 t
   }
   else if(lobe == LOBE_SPECULAR_TRANSMISSION)
   {
-    // `transmissionTint` is float3(1) for plain glTF materials; see PbrMaterial.
+    // `transmissionTint` is float3(1) for plain glTF materials; see PbrMaterial. A pane's deepens at a
+    // slant, by the view's angle, for eval and sample alike.
     f.tint = tint * mat.transmissionTint;
+    if(bsdfThinPaneTint(mat))
+      f.tint = bsdfThinTintAtSlant(f.tint, mat.ior2 / mat.ior1, abs(VdotN));
     if(bsdfFresnelInLobes(mat) && mat.specular > 0.0F)
     {
       f.tint      = f.tint / max(1.0F - bsdfSpecularAlbedo(mat, VdotN), 1e-6F);
