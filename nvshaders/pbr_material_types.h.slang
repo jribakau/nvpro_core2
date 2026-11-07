@@ -34,6 +34,10 @@ struct PbrMaterial
   float  opacity;    // 1 = opaque, 0 = fully transparent
   float2 roughness;  // 0 = smooth, 1 = rough (anisotropic: x = U, y = V)
   float  metallic;   // 0 = dielectric, 1 = metallic
+  // A metal's reflectance toward grazing, OpenPBR's F82 tint (its specular_color on a metal): at cos 1/7,
+  // about 82 degrees, the metal reflects Schlick's from its base colour times this (f82Fresnel). White,
+  // the default, leaves the metal Schlick's alone.
+  float3 edgeTint;
   float3 emissive;   // emissive color
   float  occlusion;  // occlusion factor
 
@@ -112,6 +116,7 @@ PbrMaterial defaultPbrMaterial()
   mat.opacity   = 1.0F;
   mat.roughness = float2(1.0F);
   mat.metallic  = 1.0F;
+  mat.edgeTint  = float3(1.0F);
   mat.emissive  = float3(0.0F);
 
   mat.N  = float3(0.0F, 0.0F, 1.0F);

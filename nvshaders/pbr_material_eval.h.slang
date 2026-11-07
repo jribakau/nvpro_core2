@@ -215,8 +215,9 @@ struct GltfArrayTextureFetcher : IGltfTextureFetcher
 -------------------------------------------------------------------------------------------------*/
 PbrMaterial evaluateMaterial<F : IGltfTextureFetcher>(in GltfShadeMaterial material, MeshState state, F texFetcher, GltfTextureInfo* texInfos)
 {
-  // Material Evaluated
-  PbrMaterial pbrMat;
+  // Material Evaluated: from the defaults, so the fields set below are the only ones that differ (the
+  // fork's own, such as edgeTint and plate, would be left undefined)
+  PbrMaterial pbrMat = defaultPbrMaterial();
 
   // pbrMetallicRoughness (standard)
   if(material.usePbrSpecularGlossiness == 0)

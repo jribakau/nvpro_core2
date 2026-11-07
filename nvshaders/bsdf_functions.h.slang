@@ -318,6 +318,7 @@ float fresnelCosineApproximation(float VdotN, float roughness)
 #define BSDF_FRESNEL_DIELECTRIC 1  // ior_fresnel(eta, k1.h), the exact dielectric's
 #define BSDF_FRESNEL_SCHLICK 2     // Schlick's from the tint (a metal's base colour) to white at k1.h
 #define BSDF_FRESNEL_PLATE 3       // plate_fresnel(eta, k1.h): a thin pane's two faces (bsdfIsPlate)
+#define BSDF_FRESNEL_F82 4         // f82Fresnel: Schlick's from the tint with the metal's edge tint (PbrMaterial::edgeTint)
 
 // Whether a material's dielectric lobes reflect as a thin pane, both faces (PbrMaterial::plate): a
 // thin-walled surface only, since a medium's wall is one interface.
@@ -376,6 +377,44 @@ float3 ggxMultiScatterFactor(float3 f0, float alpha, float NoV)
   const float2 sb = ggxAlbedoScaleBias(alpha, NoV);
   const float  e  = max(sb.x + sb.y, 0.05F);
   return float3(1.0F) + f0 * (1.0F / e - 1.0F);
+}
+
+/*-------------------------------------------------------------------------------------------------
+# Function `f82Fresnel`
+> OpenPBR's metal Fresnel, the F82-tint model (the Adobe Standard Material's, Kutz et al. 2021, after
+> Hoffman): Schlick's from `f0` to white, less b mu (1 - mu)^6, b set so that at mu = 1/7, about 82
+> degrees, it is `edgeTint` times Schlick's. Real metals fall furthest below Schlick's there: measured
+> chrome reflects 0.57 at 82 degrees, Schlick's from its 0.55 head-on 0.76. Head-on and at grazing it
+> is Schlick's, and with a white tint everywhere, bit for bit (b is 0). Clamped to 0..1, as a tint
+> darker than real metals' could take it below 0.
+-------------------------------------------------------------------------------------------------*/
+// b: what the tint takes off Schlick's, over mu (1 - mu)^6, whose value at 1/7 is 6^6 / 7^7
+float3 f82TintWeight(float3 f0, float3 edgeTint)
+{
+  return schlickFresnel(f0, float3(1.0F), 1.0F / 7.0F) * (float3(1.0F) - edgeTint) * (823543.0F / 46656.0F);
+}
+
+float3 f82Fresnel(float3 f0, float3 edgeTint, float mu)
+{
+  const float m  = 1.0F - mu;
+  const float m2 = m * m;
+  return clamp(schlickFresnel(f0, float3(1.0F), mu) - f82TintWeight(f0, edgeTint) * (mu * m2 * m2 * m2), float3(0.0F), float3(1.0F));
+}
+
+// What the edge tint leaves of the Fresnel's hemispherical average, 2 x the integral of F mu over mu:
+// Schlick's averages f0 + (1 - f0) / 21, and the tint's term takes b / 126 off it. Turquin's factor
+// gives a metal's lost light back by its Fresnel (ggxMultiScatterFactor), so its f0 is scaled by this:
+// an edge the tint dims gives back less. 1 for a white tint.
+float3 f82AverageShare(float3 f0, float3 edgeTint)
+{
+  const float3 schlick = f0 + (float3(1.0F) - f0) * (1.0F / 21.0F);
+  return max(schlick - f82TintWeight(f0, edgeTint) * (1.0F / 126.0F), float3(0.0F)) / max(schlick, float3(1e-6F));
+}
+
+// Whether a metal's Fresnel is f82Fresnel's: its edge tint is below white somewhere
+bool bsdfHasEdgeTint(PbrMaterial mat)
+{
+  return min(mat.edgeTint.x, min(mat.edgeTint.y, mat.edgeTint.z)) < 1.0F;
 }
 
 float dielectricF0(float eta)
@@ -948,8 +987,8 @@ void brdf_diffuse_transmission_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data,
 }
 
 
-// The Fresnel a reflection lobe weighs a microfacet by (BSDF_FRESNEL_*), at k1.h
-float3 bsdfMicrofacetFresnel(int fresnel, float eta, float3 tint, float k1h)
+// The Fresnel a reflection lobe weighs a microfacet by (BSDF_FRESNEL_*), at k1.h; `edgeTint` for F82's
+float3 bsdfMicrofacetFresnel(int fresnel, float eta, float3 tint, float3 edgeTint, float k1h)
 {
   if(fresnel == BSDF_FRESNEL_DIELECTRIC)
     return tint * ior_fresnel(eta, k1h);
@@ -957,7 +996,21 @@ float3 bsdfMicrofacetFresnel(int fresnel, float eta, float3 tint, float k1h)
     return tint * plate_fresnel(eta, k1h);
   if(fresnel == BSDF_FRESNEL_SCHLICK)
     return schlickFresnel(tint, float3(1.0F), k1h);
+  if(fresnel == BSDF_FRESNEL_F82)
+    return f82Fresnel(tint, edgeTint, k1h);
   return tint;
+}
+
+// The metal lobe's multiple scattering, as Turquin's factor gives it back: by its Fresnel's f0 (the
+// tint, the base colour), less what an edge tint takes off that Fresnel's average; 1 for other lobes.
+float3 bsdfMetalMultiScatter(PbrMaterial mat, int lobe, float3 tint, int fresnel, float NoV)
+{
+  const float alpha = 0.5f * (mat.roughness.x + mat.roughness.y);
+  if(lobe == LOBE_METAL_REFLECTION && fresnel == BSDF_FRESNEL_SCHLICK)
+    return ggxMultiScatterFactor(tint, alpha, NoV);
+  if(lobe == LOBE_METAL_REFLECTION && fresnel == BSDF_FRESNEL_F82)
+    return ggxMultiScatterFactor(tint * f82AverageShare(tint, mat.edgeTint), alpha, NoV);
+  return float3(1.0F);
 }
 
 /*-------------------------------------------------------------------------------------------------
@@ -1030,11 +1083,11 @@ void brdf_ggx_smith_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMateria
 
   data.pdf *= G1;
 
-  // A metal's lost multiple scattering, given back by its Fresnel's f0 (the base colour)
-  if(lobe == LOBE_METAL_REFLECTION && fresnel == BSDF_FRESNEL_SCHLICK)
-    bsdf *= ggxMultiScatterFactor(tint, 0.5f * (mat.roughness.x + mat.roughness.y), nk1);
+  // A metal's lost multiple scattering, given back by its Fresnel
+  if(lobe == LOBE_METAL_REFLECTION)
+    bsdf *= bsdfMetalMultiScatter(mat, lobe, tint, fresnel, nk1);
 
-  tint = bsdfMicrofacetFresnel(fresnel, eta, tint, k1h);
+  tint = bsdfMicrofacetFresnel(fresnel, eta, tint, mat.edgeTint, k1h);
 
   if(mat.iridescence > 0.0f)
   {
@@ -1132,10 +1185,10 @@ void brdf_ggx_smith_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMateria
   data.pdf = hvd * G1;
   data.pdf *= 0.25f / (nk1 * h0.z);
 
-  if(lobe == LOBE_METAL_REFLECTION && fresnel == BSDF_FRESNEL_SCHLICK)
-    data.bsdf_over_pdf *= ggxMultiScatterFactor(tint, 0.5f * (mat.roughness.x + mat.roughness.y), nk1);
+  if(lobe == LOBE_METAL_REFLECTION)
+    data.bsdf_over_pdf *= bsdfMetalMultiScatter(mat, lobe, tint, fresnel, nk1);
 
-  tint = bsdfMicrofacetFresnel(fresnel, eta, tint, kh);
+  tint = bsdfMicrofacetFresnel(fresnel, eta, tint, mat.edgeTint, kh);
 
   if(mat.iridescence > 0.0f)
   {
@@ -1659,9 +1712,10 @@ BsdfLobeFresnel bsdfLobeFresnel(PbrMaterial mat, int lobe, float VdotN, float3 t
   }
   else if(lobe == LOBE_METAL_REFLECTION)
   {
-    // glTF's metal: Schlick's from the base colour. Iridescence keeps the plain base colour.
+    // glTF's metal: Schlick's from the base colour, or OpenPBR's F82 where it has an edge tint (a named
+    // metal's). Iridescence keeps the plain base colour.
     f.tint    = mat.baseColor;
-    f.fresnel = mat.iridescence <= 0.0F ? BSDF_FRESNEL_SCHLICK : BSDF_FRESNEL_NONE;
+    f.fresnel = mat.iridescence <= 0.0F ? (bsdfHasEdgeTint(mat) ? BSDF_FRESNEL_F82 : BSDF_FRESNEL_SCHLICK) : BSDF_FRESNEL_NONE;
   }
   else if(lobe == LOBE_CLEARCOAT_REFLECTION)
   {
