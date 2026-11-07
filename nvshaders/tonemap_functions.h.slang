@@ -321,6 +321,77 @@ inline float3 splitToning(float3 color, float3 coolColor, float3 warmColor, floa
   return color * lerp(coolColor, warmColor, float3(t));
 }
 
+/*-------------------------------------------------------------------------------------------------
+# Looks
+> Creative grading on the sRGB-encoded image, after the tone curve, as a colourist's tools work on
+> display values. Every one is the identity at its default (tonemap_io.h.slang).
+-------------------------------------------------------------------------------------------------*/
+
+// Whether all three channels are `x`: the GLSL-free spelling of all(v == x), which C++'s glm
+// compares as a whole vector
+inline bool allEqual(float3 v, float x)
+{
+  return v.x == x && v.y == x && v.z == x;
+}
+
+// Black and white through a colour filter: the image's linear light weighted by `weights` (a red
+// filter's brighten skin and darken a blue sky), `amount` of it over the colour.
+inline float3 monoAdjust(float3 color, float3 weights, float amount)
+{
+  const float y = max(dot(toLinear(color), weights), 0.0F);
+  return lerp(color, toSrgb(float3(y)), float3(amount));
+}
+
+// Lift, gamma and gain a channel: lift is added to the shadows and fades to nothing at white, gain
+// scales everything (white most), gamma then bends the midtones (above 1 lighter).
+inline float3 liftGammaGain(float3 color, float3 lift, float3 gamma, float3 gain)
+{
+  const float3 c = gain * (color + lift * (float3(1.0F) - color));
+  return pow(max(c, float3(0.0F)), float3(1.0F) / gamma);
+}
+
+// Each channel to `levels` steps, `amount` of it over the image.
+inline float3 posterizeAdjust(float3 color, float levels, float amount)
+{
+  const float  steps = levels - 1.0F;
+  const float3 p     = round(saturate(color) * float3(steps)) / float3(steps);
+  return lerp(color, p, float3(amount));
+}
+
+// A cell of the grain, for the frame's seed: [0, 1)
+inline float grainHash(int2 cell, uint32_t seed)
+{
+  uint32_t h = uint32_t(cell.x) * 0x8DA6B343u + uint32_t(cell.y) * 0xD8163841u + seed * 0xCB1AB31Fu;
+  h ^= h >> 16;
+  h *= 0x7FEB352Du;
+  h ^= h >> 15;
+  h *= 0x846CA68Bu;
+  h ^= h >> 16;
+  return float(h >> 8) * (1.0F / 16777216.0F);
+}
+
+// Film grain, the same in every channel: smooth value noise on cells 1.3 pixels across at 1080
+// lines, larger on a larger image so a picture's grain is the same at every size (and off the pixel
+// grid, so the cells don't show), strongest in the midtones as a negative's is. `amount` 1 is heavy:
+// a mid grey moves by up to about 0.2.
+inline float3 filmGrain(float3 color, float amount, float2 pixel, float2 imageSize, uint32_t seed)
+{
+  const float  cellSize = 1.3F * max(imageSize.y / 1080.0F, 1.0F);
+  const float2 p        = (pixel + float2(0.5F)) / cellSize;
+  const float2 i        = floor(p);
+  const float2 f        = p - i;
+  const float2 u        = f * f * (float2(3.0F) - 2.0F * f);
+  const int2   c        = int2(i);
+  const float  n00      = grainHash(c, seed);
+  const float  n10      = grainHash(c + int2(1, 0), seed);
+  const float  n01      = grainHash(c + int2(0, 1), seed);
+  const float  n11      = grainHash(c + int2(1, 1), seed);
+  const float  n        = (n00 + (n10 - n00) * u.x) + ((n01 + (n11 - n01) * u.x) - (n00 + (n10 - n00) * u.x)) * u.y;
+  const float  y        = luminance(saturate(color));
+  const float  midtones = 0.35F + 2.6F * y * (1.0F - y);  // 0.35 at black and at white, 1 at mid grey
+  return color + float3((n * 2.0F - 1.0F) * 0.2F * amount * midtones);
+}
+
 // Returns a matrix that corrects a light source with the given Kelvin
 // temperature and Duv tint to RGB (1,1,1), then multiplies by exposure.
 // Use it like mul(inputMatrix, color).
@@ -458,7 +529,13 @@ inline float3 applyTonemap(TonemapperData tm, float3 color, float2 pixel, float2
   
   // saturation
   c = adjustSaturation(c, tm.saturation);
-  
+
+  // black and white, through a colour filter
+  if(tm.mono > 0.0F)
+  {
+    c = monoAdjust(c, tm.monoMix, tm.mono);
+  }
+
   // Advanced color grading
   // vibrance (selective saturation boost for desaturated colors)
   if(tm.vibrance != 0.0F)
@@ -470,20 +547,36 @@ inline float3 applyTonemap(TonemapperData tm, float3 color, float2 pixel, float2
   {
     c = smhAdjust(c, tm.shadowBias, tm.midtoneBias, tm.highlightBias);
   }
+  // lift, gamma and gain
+  if(!allEqual(tm.lift, 0.0F) || !allEqual(tm.gamma, 1.0F) || !allEqual(tm.gain, 1.0F))
+  {
+    c = liftGammaGain(c, tm.lift, tm.gamma, tm.gain);
+  }
   // split toning (cool shadows, warm highlights)
   if(tm.coolColor.x != 1.0F || tm.coolColor.y != 1.0F || tm.coolColor.z != 1.0F ||
      tm.warmColor.x != 1.0F || tm.warmColor.y != 1.0F || tm.warmColor.z != 1.0F)
   {
     c = splitToning(c, tm.coolColor, tm.warmColor, tm.splitBalance);
   }
-  
+  // posterising
+  if(tm.posterize >= 2.0F && tm.posterizeMix > 0.0F)
+  {
+    c = posterizeAdjust(c, tm.posterize, tm.posterizeMix);
+  }
+
   // vignette
   float2 center_uv = (pixel / imageSize) * 2.0F - 1.0F;
   c *= 1.0F - dot(center_uv, center_uv) * tm.vignette;
 
-  // The exposure view: the stops of what the image shows, undithered
+  // The exposure view: the stops of what the image shows, undithered and without grain
   if(tm.falseColor != 0)
     return falseColorExposure(exposed, c);
+
+  // film grain
+  if(tm.grain > 0.0F)
+  {
+    c = filmGrain(c, tm.grain, pixel, imageSize, tm.grainSeed);
+  }
 
   // Dither assuming 8-bit output.
   if(tm.dither == 1)

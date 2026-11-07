@@ -93,6 +93,18 @@ struct TonemapperData
   float3 warmColor    SLANG_DEFAULT(float3(1.0f, 1.0f, 1.0f));  // Tint for highlights in split toning
   float splitBalance  SLANG_DEFAULT(0.0f);  // -0.5 to 0.5: Balance between cool and warm tones
 
+  // Looks (applyTonemap, after Saturation): black and white through a colour filter, lift, gamma and
+  // gain a channel, posterising and film grain. The defaults leave the image as it is.
+  float3   monoMix      SLANG_DEFAULT(float3(0.2126F, 0.7152F, 0.0722F));  // the black-and-white image's weights of linear R, G, B
+  float    mono         SLANG_DEFAULT(0.0F);                               // 0 colour to 1 black and white
+  float3   lift         SLANG_DEFAULT(float3(0.0F));                       // added to the shadows, fading to nothing at white
+  float3   gamma        SLANG_DEFAULT(float3(1.0F));                       // above 1 lightens the midtones
+  float3   gain         SLANG_DEFAULT(float3(1.0F));                       // scales everything, white most
+  float    posterize    SLANG_DEFAULT(0.0F);                               // levels a channel; under 2 none
+  float    posterizeMix SLANG_DEFAULT(1.0F);                               // how much of the posterised image
+  float    grain        SLANG_DEFAULT(0.0F);                               // film grain's strength, 0 none
+  uint32_t grainSeed    SLANG_DEFAULT(0);                                  // which grain: the frame's, so it moves as film's does
+
   // Auto-Exposure
   int      autoExposure         SLANG_DEFAULT(0);      // 0: off, 1: on
   float    autoExposureSpeed    SLANG_DEFAULT(5.0F);   // Speed of auto-exposure adjustment
