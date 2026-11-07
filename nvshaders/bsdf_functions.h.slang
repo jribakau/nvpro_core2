@@ -1818,26 +1818,6 @@ int bsdfEvaluateCore(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial ma
 }
 
 /*-------------------------------------------------------------------------------------------------
-# Function `bsdfEvaluateRetroreflectionBlend`
-> Blends a Minimal Retroreflective Microfacet Model evaluation into an already evaluated forward BSDF.
--------------------------------------------------------------------------------------------------*/
-void bsdfEvaluateRetroreflectionBlend(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat, float blend)
-{
-  // Portsmouth et al. 2026's Minimal Retroreflective Microfacet Model
-  // (https://jcgt.org/published/0015/01/04/) wraps an existing microfacet BSDF
-  // by replacing the view direction V with reflect(-V, N).
-  BsdfEvaluateData dRetro;
-  dRetro.k1 = reflect(-data.k1, mat.N);
-  dRetro.k2 = data.k2;
-  dRetro.xi = data.xi;
-  bsdfEvaluateCore(dRetro, mat);
-
-  data.bsdf_diffuse = lerp(data.bsdf_diffuse, dRetro.bsdf_diffuse, blend);
-  data.bsdf_glossy  = lerp(data.bsdf_glossy, dRetro.bsdf_glossy, blend);
-  data.pdf          = lerp(data.pdf, dRetro.pdf, blend);
-}
-
-/*-------------------------------------------------------------------------------------------------
 # Function `bsdfEvaluate`
 > Evaluates the full BSDF model for the given material and set of directions.
 
@@ -1852,34 +1832,79 @@ the sampling code will return this direction will be returned in `data.pdf`.
 -------------------------------------------------------------------------------------------------*/
 void bsdfEvaluate(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat)
 {
-  // Evaluate forward directly into the output; no dForward copy.
-  const int   lobe  = bsdfEvaluateCore(data, mat);
-  const float blend = mat.retroreflection;
-  // Portsmouth et al. Sec. 5 / MaterialX: MRM applies to the base specular lobes only; keep
-  // regular BTDF, clearcoat, and sheen unaffected.
-  if(blend > 0.0f && isRetroreflectionLobe(lobe))
+  // Portsmouth et al. 2026's Minimal Retroreflective Microfacet Model
+  // (https://jcgt.org/published/0015/01/04/) wraps an existing microfacet BSDF by replacing the view
+  // direction V with reflect(-V, N), blended with the forward evaluation by mat.retroreflection.
+  // Portsmouth et al. Sec. 5 / MaterialX: MRM applies to the base specular lobes only; regular BTDF,
+  // clearcoat, and sheen are unaffected. The mirrored evaluation, which picks its own lobe, is the
+  // loop's second pass, so that it is not a second copy in line (bsdfEvaluateLobeBlended).
+  const float  blend   = mat.retroreflection;
+  const float3 k1      = data.k1;
+  float3       diffuse = float3(0.0f);
+  float3       glossy  = float3(0.0f);
+  float        pdf     = 0.0f;
+  int          passes  = 1;
+#if defined(__SLANG__)
+  [loop]
+#endif
+  for(int pass = 0; pass < passes; pass++)
   {
-    bsdfEvaluateRetroreflectionBlend(data, mat, blend);
+    data.k1        = pass == 0 ? k1 : reflect(-k1, mat.N);
+    const int lobe = bsdfEvaluateCore(data, mat);
+    if(pass == 0)
+    {
+      diffuse = data.bsdf_diffuse;
+      glossy  = data.bsdf_glossy;
+      pdf     = data.pdf;
+      if(blend > 0.0f && isRetroreflectionLobe(lobe))
+        passes = 2;
+    }
+  }
+  data.k1 = k1;
+  if(passes > 1)
+  {
+    data.bsdf_diffuse = lerp(diffuse, data.bsdf_diffuse, blend);
+    data.bsdf_glossy  = lerp(glossy, data.bsdf_glossy, blend);
+    data.pdf          = lerp(pdf, data.pdf, blend);
   }
 }
 
 // One lobe with the MRM blend on the base lobes (diffuse, specular, metal): value and pdf are
 // lerp(at k1, at reflect(-k1, N), b). reflect(-k1, N) has the same N.k1, so the weights and tint are
 // the forward ones.
+//
+// The two evaluations are one loop's passes: a shader compiler inlines every call, and the lobe
+// evaluated a second time in line doubled the lobes of every sum over them (bsdfEvaluateSumWeighted:
+// next-event estimation's, and the sampler's mixture pdf), some 8 s of the path tracer's 55 s build
+// on an RTX 4080's driver (2026-11-07).
 void bsdfEvaluateLobeBlended(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat, int lobe, float3 tint)
 {
-  bsdfEvaluateLobe(data, mat, lobe, tint);
-  const float blend = mat.retroreflection;
-  if(blend > 0.0f && isRetroreflectionLobe(lobe))
+  const float  blend   = mat.retroreflection;
+  const int    passes  = (blend > 0.0f && isRetroreflectionLobe(lobe)) ? 2 : 1;
+  const float3 k1      = data.k1;
+  float3       diffuse = float3(0.0f);
+  float3       glossy  = float3(0.0f);
+  float        pdf     = 0.0f;
+#if defined(__SLANG__)
+  [loop]
+#endif
+  for(int pass = 0; pass < passes; pass++)
   {
-    BsdfEvaluateData r;
-    r.k1 = reflect(-data.k1, mat.N);
-    r.k2 = data.k2;
-    r.xi = data.xi;
-    bsdfEvaluateLobe(r, mat, lobe, tint);
-    data.bsdf_diffuse = lerp(data.bsdf_diffuse, r.bsdf_diffuse, blend);
-    data.bsdf_glossy  = lerp(data.bsdf_glossy, r.bsdf_glossy, blend);
-    data.pdf          = lerp(data.pdf, r.pdf, blend);
+    data.k1 = pass == 0 ? k1 : reflect(-k1, mat.N);
+    bsdfEvaluateLobe(data, mat, lobe, tint);
+    if(pass == 0)
+    {
+      diffuse = data.bsdf_diffuse;
+      glossy  = data.bsdf_glossy;
+      pdf     = data.pdf;
+    }
+  }
+  data.k1 = k1;
+  if(passes > 1)
+  {
+    data.bsdf_diffuse = lerp(diffuse, data.bsdf_diffuse, blend);
+    data.bsdf_glossy  = lerp(glossy, data.bsdf_glossy, blend);
+    data.pdf          = lerp(pdf, data.pdf, blend);
   }
 }
 
