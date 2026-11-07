@@ -212,6 +212,105 @@ inline float3 tonemapKhronosPBR(float3 color)
   return toSrgb(color);
 }
 
+/*-------------------------------------------------------------------------------------------------
+# Function `tonemapShaped`
+> A filmic curve with two handles, worked in stops: `u` stops over mid grey in (0.18), `Y` stops over
+> mid grey out. Mid grey comes out at 0.14, with a slope of 1.3 stops out a stop in, as Khronos PBR
+> Neutral gives it, so switching to it from Neutral keeps a picture's exposure. Above mid grey a
+> rational quadratic Bezier from there, along that slope, to white at 16 (SHAPED_WHITE), which it
+> reaches flat: its middle point's weight is the shoulder (`shoulder` 0: 4, highlights bright and
+> rolling off late, about as Neutral's; 1: a quarter, rolling off early and gently). Below mid grey the
+> same slope, steepened past 1.5 stops down by up to 1.5 more stops a stop (`toe` 0 open shadows, 1
+> crushed). Each handle moves its own side of mid grey only, and the curve rises for every value of
+> both and is white by 16, which the firefly clamp counts on (fv_lighting.cpp kFireflyClamp).
+>
+> Applied to the brightest channel with the hue kept, then eased to white as that channel is
+> compressed (Neutral's way), so a bright red stays red on its way to white rather than turning orange.
+-------------------------------------------------------------------------------------------------*/
+static const float SHAPED_MID_IN       = 0.18F;
+static const float SHAPED_MID_OUT      = 0.14F;
+static const float SHAPED_SLOPE        = 1.3F;   // stops out a stop in, at mid grey
+static const float SHAPED_WHITE        = 16.0F;  // the value that comes out white
+static const float SHAPED_TOE_START    = 1.5F;   // stops under mid grey where the toe bends
+static const float SHAPED_TOE_KNEE     = 0.5F;   // the bend's half-width, stops
+static const float SHAPED_TOE_MAX      = 1.5F;   // the steepening at a toe of 1, stops out a stop in
+static const float SHAPED_DESATURATION = 0.15F;  // Neutral's: how fast a compressed colour goes white
+
+inline float shapedMax(float a, float b)
+{
+  return a > b ? a : b;
+}
+inline float shapedMin(float a, float b)
+{
+  return a < b ? a : b;
+}
+
+// The Bezier's middle weight for a shoulder of 0 to 1: 4 (hard) to 1/4 (soft), 1 halfway
+inline float shapedShoulderWeight(float shoulder)
+{
+  return exp2(2.0F - 4.0F * shapedMin(shapedMax(shoulder, 0.0F), 1.0F));
+}
+
+// Stops out for `u` stops in, from mid grey to white (0 <= u <= log2(SHAPED_WHITE / SHAPED_MID_IN)):
+// the Bezier P0 (0, 0), P1 (yw / SHAPED_SLOPE, yw), P2 (uw, yw), P1 weighed `weight`, solved for its
+// parameter at u (the root in [0, 1] of a quadratic, in the form that stays stable as u goes to 0)
+inline float shapedShoulderStops(float u, float weight)
+{
+  const float yw   = log2(1.0F / SHAPED_MID_OUT);
+  const float uw   = log2(SHAPED_WHITE / SHAPED_MID_IN);
+  const float x1   = yw / SHAPED_SLOPE;
+  const float w    = weight;
+  const float a    = u * (2.0F - 2.0F * w) + 2.0F * w * x1 - uw;
+  const float b    = u * (2.0F * w - 2.0F) - 2.0F * w * x1;
+  const float disc = sqrt(shapedMax(b * b - 4.0F * a * u, 0.0F));
+  const float t    = shapedMin(shapedMax(2.0F * u / shapedMax(disc - b, 1e-12F), 0.0F), 1.0F);
+  const float d    = (1.0F - t) * (1.0F - t) + 2.0F * w * t * (1.0F - t) + t * t;
+  return (2.0F * w * t * (1.0F - t) + t * t) * yw / d;
+}
+
+// Stops out for `u` stops in under mid grey (u <= 0): the mid slope, steepened past the toe's start
+inline float shapedToeStops(float u, float toe)
+{
+  const float v    = -u - SHAPED_TOE_START;
+  const float h    = SHAPED_TOE_KNEE;
+  const float bent = v <= -h ? 0.0F : (v >= h ? v : (v + h) * (v + h) / (4.0F * h));
+  return SHAPED_SLOPE * u - SHAPED_TOE_MAX * shapedMin(shapedMax(toe, 0.0F), 1.0F) * bent;
+}
+
+// The curve on one value: linear in, linear display out (before the sRGB encoding), 0 to 1
+inline float shapedCurve(float x, float toe, float shoulder)
+{
+  if(!(x > 0.0F))
+    return 0.0F;
+  const float u  = log2(x / SHAPED_MID_IN);
+  const float uw = log2(SHAPED_WHITE / SHAPED_MID_IN);
+  if(u >= uw)
+    return 1.0F;
+  const float y = u >= 0.0F ? shapedShoulderStops(u, shapedShoulderWeight(shoulder)) : shapedToeStops(u, toe);
+  return shapedMin(SHAPED_MID_OUT * exp2(y), 1.0F);
+}
+
+// The curve on a colour, linear display out: the brightest channel through it, the hue kept, then
+// eased to white by how much that channel was compressed
+inline float3 tonemapShapedLinear(float3 color, float toe, float shoulder)
+{
+  color            = max(color, float3(0.0F));
+  const float peak = shapedMax(color.x, shapedMax(color.y, color.z));
+  if(!(peak > 0.0F))
+    return float3(0.0F);
+  const float newPeak = shapedCurve(peak, toe, shoulder);
+  if(peak > 3.0e38F)  // an infinite pixel: white
+    return float3(1.0F);
+  color *= newPeak / peak;
+  const float g = 1.0F - 1.0F / (SHAPED_DESATURATION * shapedMax(peak - newPeak, 0.0F) + 1.0F);
+  return lerp(color, float3(newPeak), float3(g));
+}
+
+inline float3 tonemapShaped(float3 color, float toe, float shoulder)
+{
+  return toSrgb(tonemapShapedLinear(color, toe, shoulder));
+}
+
 // Computes the CIE 1960 chromaticity coordinates of a light source given
 // temperature and tint.
 //
@@ -516,6 +615,9 @@ inline float3 applyTonemap(TonemapperData tm, float3 color, float2 pixel, float2
       break;
     case TONEMAP_METHOD(eKhronosPBR):
       c = tonemapKhronosPBR(color);
+      break;
+    case TONEMAP_METHOD(eShaped):
+      c = tonemapShaped(color, tm.shapedToe, tm.shapedShoulder);
       break;
   }
 

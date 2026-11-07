@@ -31,7 +31,7 @@ bool tonemapperWidget(shaderio::TonemapperData& tonemapper)
 {
   bool changed{false};
 
-  const char* items[] = {"Filmic", "Uncharted 2", "Clip", "ACES", "AgX", "Khronos PBR"};
+  const char* items[] = {"Filmic", "Uncharted 2", "Clip", "ACES", "AgX", "Khronos PBR", "Shaped"};
 
   if(PE::begin())
   {

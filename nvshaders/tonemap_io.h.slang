@@ -39,7 +39,8 @@ NAMESPACE_SHADERIO_BEGIN()
 #define ToneMapMethod_eACES 3
 #define ToneMapMethod_eAgX 4
 #define ToneMapMethod_eKhronosPBR 5
-#define ToneMapMethod_eCount 6
+#define ToneMapMethod_eShaped 6
+#define ToneMapMethod_eCount 7
 #else
 #define TONEMAP_METHOD(name) ToneMapMethod::name
 
@@ -51,6 +52,7 @@ enum ToneMapMethod
   eACES,
   eAgX,
   eKhronosPBR,
+  eShaped,  // tonemapShaped: a filmic curve with a toe and a shoulder to set
   eCount
 };
 
@@ -117,6 +119,10 @@ struct TonemapperData
   int dither SLANG_DEFAULT(1);  // 0: no dither, 1: dither
   // 1: the false-colour exposure view (falseColorExposure) in place of the image
   int falseColor SLANG_DEFAULT(0);
+  // The Shaped curve's handles (tonemapShaped), 0 to 1 each: how deep the shadows go, and how early
+  // and gently the highlights roll off into white
+  float shapedToe      SLANG_DEFAULT(0.5F);
+  float shapedShoulder SLANG_DEFAULT(0.5F);
 };
 
 
