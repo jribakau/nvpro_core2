@@ -129,6 +129,60 @@ float3 hvd_ggx_sample_vndf(float3 k, float2 roughness, float2 xi)
   return normalize(h);
 }
 
+/*-------------------------------------------------------------------------------------------------
+# Function `ggx_vndf_reflection_bound`
+> Eto and Tokuyoshi 2023's bound ("Bounded VNDF Sampling for Smith-GGX Reflections") for reflections
+> of the view `k` (local, unit, k.z > 0): the spherical cap Dupuy and Benyoub 2023's sampler draws the
+> visible normals from is cut to z >= -bound * v.z instead of -v.z, which leaves out only microfacets
+> whose mirror direction lies below the surface. 1 at alpha 0, falling to 0 at alpha 1, where half the
+> cap went below. An anisotropic lobe takes its smaller alpha: that cuts less, and stays exact.
+-------------------------------------------------------------------------------------------------*/
+float ggx_vndf_reflection_bound(float3 k, float2 roughness)
+{
+  const float a  = min(max(min(roughness.x, roughness.y), 0.0f), 1.0f);
+  const float s  = 1.0f + length(float2(k.x, k.y));
+  const float a2 = a * a;
+  const float s2 = s * s;
+  return (1.0f - a2) * s2 / (s2 + a2 * k.z * k.z);
+}
+
+/*-------------------------------------------------------------------------------------------------
+# Function `hvd_ggx_sample_vndf_bounded`
+> A half vector for a GGX reflection of the view `k` (local: `float3(dot(T, k1), dot(B, k1), dot(N,
+> k1))`): the visible normals by Dupuy and Benyoub 2023's spherical cap, less the part that only
+> reflects below the surface (`ggx_vndf_reflection_bound`). Fewer reflections lost below the horizon
+> at a grazing view, the more so the rougher the lobe. Its pdf over the reflected directions is
+> D(h) * `ggx_vndf_reflection_g1` / (4 k.z). For reflection only: a refraction can leave through the
+> cut part. A degenerate draw returns (0, 0, 0).
+-------------------------------------------------------------------------------------------------*/
+float3 hvd_ggx_sample_vndf_bounded(float3 k, float2 roughness, float2 xi)
+{
+  const float3 v    = normalize(float3(k.x * roughness.x, k.y * roughness.y, k.z));
+  const float  b    = (k.z > 0.0f ? ggx_vndf_reflection_bound(k, roughness) : 1.0f) * v.z;
+  const float  phi  = M_TWO_PI * xi.x;
+  const float  z    = (1.0f - xi.y) * (1.0f + b) - b;
+  const float  sinT = sqrt(max(0.0f, 1.0f - z * z));
+  const float3 m    = v + float3(sinT * cos(phi), sinT * sin(phi), z);
+  const float3 h    = float3(m.x * roughness.x, m.y * roughness.y, max(0.0f, m.z));
+  const float  len2 = dot(h, h);
+  return len2 > 0.0f ? h / sqrt(len2) : float3(0.0f);
+}
+
+/*-------------------------------------------------------------------------------------------------
+# Function `ggx_vndf_reflection_g1`
+> What stands for the masking G1 in the bounded sampler's pdf (`hvd_ggx_sample_vndf_bounded`), as the
+> VNDF's pdf of a reflected direction is D(h) G1(k) / (4 k.z): 2 k.z / (bound * k.z + t), with
+> t = |(alpha_x k.x, alpha_y k.y, k.z)|. Smith's G1 at bound 1; above it, and above 1 on a rough
+> lobe, as the cut cap draws what is left more densely.
+-------------------------------------------------------------------------------------------------*/
+float ggx_vndf_reflection_g1(float3 k, float2 roughness)
+{
+  const float ax = k.x * roughness.x;
+  const float ay = k.y * roughness.y;
+  const float t  = sqrt(ax * ax + ay * ay + k.z * k.z);
+  return 2.0f * k.z / (ggx_vndf_reflection_bound(k, roughness) * k.z + t);
+}
+
 float smith_shadow_or_mask(const float3 k, const float2 roughness)
 {
   float kz2 = k.z * k.z;
@@ -163,7 +217,8 @@ float ggx_smith_shadow_mask(NVSHADERS_OUT_TYPE(float) G1, NVSHADERS_OUT_TYPE(flo
 
 A microfacet hidden from one direction is likelier hidden from the other, so the joint term is
 larger than the product (Heitz 2014), most at grazing on rough surfaces. G1 and G2 are each
-direction's own masking, as `ggx_smith_shadow_mask` gives them; the VNDF pdf keeps G1. For
+direction's own masking, as `ggx_smith_shadow_mask` gives them; the reflection sampler's pdf
+keeps its own stand-in for G1 (`ggx_vndf_reflection_g1`). For
 reflection only: transmission's correlated form differs.
 -------------------------------------------------------------------------------------------------*/
 float ggx_smith_shadow_mask_correlated(NVSHADERS_OUT_TYPE(float) G1, NVSHADERS_OUT_TYPE(float) G2, const float3 k1, const float3 k2, const float2 roughness)

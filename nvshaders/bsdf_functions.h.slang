@@ -1081,7 +1081,8 @@ void brdf_ggx_smith_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMateria
 
   float3 bsdf = float3(G12 * data.pdf);
 
-  data.pdf *= G1;
+  // The density brdf_ggx_smith_sample draws k2 by: the bounded VNDF's (hvd_ggx_sample_vndf_bounded)
+  data.pdf *= ggx_vndf_reflection_g1(k1l, mat.roughness);
 
   // A metal's lost multiple scattering, given back by its Fresnel
   if(lobe == LOBE_METAL_REFLECTION)
@@ -1128,8 +1129,9 @@ void brdf_ggx_smith_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMateria
   }
   const float3 k10 = float3(dot(data.k1, mat.T), dot(data.k1, mat.B), nk1);
 
-  // Sample half-vector, microfacet normal.
-  const float3 h0 = hvd_ggx_sample_vndf(k10, mat.roughness, data.xi.xy);
+  // Sample half-vector, microfacet normal: the visible normals less those that only reflect below the
+  // surface (Eto and Tokuyoshi 2023), so fewer samples are lost at a grazing view on a rough lobe
+  const float3 h0 = hvd_ggx_sample_vndf_bounded(k10, mat.roughness, data.xi.xy);
   if(h0.z == 0.0f)
   {
     data.event_type = BSDF_EVENT_ABSORB;
@@ -1177,12 +1179,14 @@ void brdf_ggx_smith_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMateria
   if(mat.gaussianSlopes)
     G12 = beckmann_smith_shadow_mask_correlated(k10, k20, mat.roughness) * bsdfGaussianSlopeShare(mat, h0, hvd);
 
-  // The VNDF sample's pdf has G1: what is left of the joint masking
-  data.bsdf_over_pdf = float3(G12 / G1);
+  // The bounded VNDF sample's pdf has its stand-in for G1 (ggx_vndf_reflection_g1): what is left of
+  // the joint masking over it
+  const float G1b    = ggx_vndf_reflection_g1(k10, mat.roughness);
+  data.bsdf_over_pdf = float3(G12 / G1b);
   data.event_type    = BSDF_EVENT_GLOSSY_REFLECTION;
 
   // Compute pdf
-  data.pdf = hvd * G1;
+  data.pdf = hvd * G1b;
   data.pdf *= 0.25f / (nk1 * h0.z);
 
   if(lobe == LOBE_METAL_REFLECTION)
