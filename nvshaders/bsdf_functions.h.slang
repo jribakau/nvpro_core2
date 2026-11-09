@@ -102,6 +102,7 @@ and a V-cavity shadowing-masking function).
 #include "functions.h.slang"           // cosineSampleHemisphere
 #include "pbr_ggx_microfacet.h.slang"  // brdfLambertian, ..
 #include "ggx_albedo_table.h.slang"
+#include "ggx_transmission_table.h.slang"
 #include "sheen_albedo_table.h.slang"
 #include "bsdf_types.h.slang"
 #include "pbr_material_types.h.slang"
@@ -463,6 +464,68 @@ float ggxPlateAlbedo(float eta, float alpha, float NoV)
   const float  m       = 1.0F - cosine;
   const float  schlick = p0 + (1.0F - p0) * m * m * m * m * m;
   return clamp(p0 * sb.x + sb.y + (plate_fresnel(eta, cosine) - schlick) * (sb.x + sb.y), 0.0F, 1.0F);
+}
+
+/*-------------------------------------------------------------------------------------------------
+# Function `ggxTransmissionGain`
+> How much more light a rough dielectric boundary of index `eta` (above 1: entering the denser side)
+> transmits than the GGX refraction lobe (btdf_ggx_smith_sample) gives it, at view cosine `NoV`, where
+> each microfacet's reflection takes `reflected` times its Fresnel (BsdfLobeFresnel's). The lobe is single
+> scattering: light its refracted ray's masking blocks is lost, where on a real microsurface it meets the
+> surface again and mostly goes in. The baked tables (ggx_transmission_table.h.slang), trilinear in
+> sqrt(2 (eta - 1) / (eta + 1)), perceptual roughness and sqrt(NoV): the lobe's share of what Heitz et al.
+> 2016's microsurface random walk lets in, the gain for a boundary with all its Fresnel; and the lobe's
+> transmission with none, the masking alone, which a boundary that reflects nothing lets in whole. A
+> weight s between (DAZ's skin splits its reflection over two lobes, 0.2-0.6 in the first) lets in all
+> but what it reflects, 1 - s E with E the boundary's albedo (ggxDielectricAlbedo): the gain is that over
+> the lobe's, (1 - s) times the masking plus s times the share of 1 - E. 1 on a smooth boundary; at index
+> 1.4 and roughness 0.5 with all its Fresnel, 1.02 at 45 degrees, 1.07 at 70 and 1.12 at 80. With no
+> boundary (index 1) it is 1 over the masking, unbounded at grazing: held to 100.
+-------------------------------------------------------------------------------------------------*/
+// One entry of a table: `masked`, or the share
+float ggxTransmissionAt(bool masked, int n)
+{
+  return masked ? GGX_TRANSMISSION_MASKED[n] : GGX_TRANSMISSION_SHARE[n];
+}
+
+// One of the tables trilinear at entry n0 (n1 the next index, r the next roughness)
+float ggxTransmissionTable(bool masked, int n0, int n1, int r, float fx, float fy, float fe)
+{
+  const float a0 = lerp(ggxTransmissionAt(masked, n0), ggxTransmissionAt(masked, n0 + r), fx);
+  const float a1 = lerp(ggxTransmissionAt(masked, n0 + 1), ggxTransmissionAt(masked, n0 + r + 1), fx);
+  const float b0 = lerp(ggxTransmissionAt(masked, n1), ggxTransmissionAt(masked, n1 + r), fx);
+  const float b1 = lerp(ggxTransmissionAt(masked, n1 + 1), ggxTransmissionAt(masked, n1 + r + 1), fx);
+  return lerp(lerp(a0, a1, fy), lerp(b0, b1, fy), fe);
+}
+
+float3 ggxTransmissionGain(float eta, float alpha, float NoV, float3 reflected)
+{
+  const int    lastE  = GGX_TRANSMISSION_TABLE_ETAS - 1;
+  const int    last   = GGX_TRANSMISSION_TABLE_RES - 1;
+  const float  e      = sqrt(clamp(2.0F * (eta - 1.0F) / (eta + 1.0F), 0.0F, 1.0F)) * float(lastE);
+  const float  x      = sqrt(clamp(alpha, 0.0F, 1.0F)) * float(last);
+  const float  y      = sqrt(clamp(NoV, 0.0F, 1.0F)) * float(last);
+  const int    k      = min(int(e), lastE - 1);
+  const int    i      = min(int(x), last - 1);
+  const int    j      = min(int(y), last - 1);
+  const int    n0     = (k * GGX_TRANSMISSION_TABLE_RES + i) * GGX_TRANSMISSION_TABLE_RES + j;
+  const int    n1     = n0 + GGX_TRANSMISSION_TABLE_RES * GGX_TRANSMISSION_TABLE_RES;
+  const int    r      = GGX_TRANSMISSION_TABLE_RES;
+  const float  share  = ggxTransmissionTable(false, n0, n1, r, x - float(i), y - float(j), e - float(k));
+  const float  masked = ggxTransmissionTable(true, n0, n1, r, x - float(i), y - float(j), e - float(k));
+  const float  albedo = ggxDielectricAlbedo(eta, alpha, NoV);
+  const float3 s      = clamp(reflected, float3(0.0F), float3(1.0F));
+  const float3 lobe   = (float3(1.0F) - s) * masked + s * (share * (1.0F - albedo));
+  return (float3(1.0F) - s * albedo) / max(lobe, float3(0.01F));
+}
+
+// Whether `mat`'s refraction lobe takes back what its masking loses (ggxTransmissionGain): a medium's
+// boundary met from its rarer side, under GGX's slopes. Not a thin wall, whose transmission is a
+// mirrored reflection, nor from the denser side, where total internal reflection is part of the lobe,
+// nor under Gaussian slopes (bsdfGaussianSlopeShare), whose masking differs.
+bool bsdfRegainsMaskedTransmission(PbrMaterial mat)
+{
+  return mat.thickness > 0.0F && mat.ior2 >= mat.ior1 && !mat.gaussianSlopes;
 }
 
 // The share of the light at view cosine `VdotN` the dielectric specular lobe reflects
@@ -1740,6 +1803,9 @@ BsdfLobeFresnel bsdfLobeFresnel(PbrMaterial mat, int lobe, float VdotN, float3 t
       f.tint      = f.tint / max(1.0F - bsdfSpecularAlbedo(mat, VdotN), 1e-6F);
       f.reflected = mat.specular * mat.specularColor;
     }
+    // What the refracted ray's masking blocked, given back: a rough boundary lets it in
+    if(bsdfRegainsMaskedTransmission(mat))
+      f.tint *= ggxTransmissionGain(mat.ior2 / mat.ior1, 0.5F * (mat.roughness.x + mat.roughness.y), abs(VdotN), f.reflected);
   }
   else if(lobe == LOBE_METAL_REFLECTION)
   {
