@@ -123,6 +123,12 @@ struct TonemapperData
   // and gently the highlights roll off into white
   float shapedToe      SLANG_DEFAULT(0.5F);
   float shapedShoulder SLANG_DEFAULT(0.5F);
+  // A small sensor's picture (applyTonemap), 0 to 1 each and 0 none: `sensorClip`, how much of the
+  // curve gives way to a response that is straight up to white and clips there a channel at a time
+  // (sensorClipCurve); `sensorNoise`, noise that is strongest in the shadows and coloured (sensorNoise),
+  // moving with grainSeed
+  float sensorClip  SLANG_DEFAULT(0.0F);
+  float sensorNoise SLANG_DEFAULT(0.0F);
 };
 
 

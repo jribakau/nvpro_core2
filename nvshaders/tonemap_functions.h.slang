@@ -491,6 +491,55 @@ inline float3 filmGrain(float3 color, float amount, float2 pixel, float2 imageSi
   return color + float3((n * 2.0F - 1.0F) * 0.2F * amount * midtones);
 }
 
+// A small sensor's response in place of a tone curve's shoulder: straight up to white, where each
+// channel clips on its own (a bright warm light goes yellow, then white, with a hard edge), exposed so
+// that middle grey lands where the curve has it. `curveGrey` is the curve's value for 0.18, linear.
+// sRGB-encoded, as the curves' results.
+inline float3 sensorClipCurve(float3 color, float curveGrey)
+{
+  return toSrgb(saturate(color * (curveGrey / 0.18F)));
+}
+
+// A cell of sensorNoise: smooth value noise in [0, 1) at `p`, in cells
+inline float sensorNoiseCell(float2 p, uint32_t seed)
+{
+  const float2 i   = floor(p);
+  const float2 f   = p - i;
+  const float2 u   = f * f * (float2(3.0F) - 2.0F * f);
+  const int2   c   = int2(i);
+  const float  n00 = grainHash(c, seed);
+  const float  n10 = grainHash(c + int2(1, 0), seed);
+  const float  n01 = grainHash(c + int2(0, 1), seed);
+  const float  n11 = grainHash(c + int2(1, 1), seed);
+  const float  top = n00 + (n10 - n00) * u.x;
+  const float  bot = n01 + (n11 - n01) * u.x;
+  return top + (bot - top) * u.y;
+}
+
+// How much of sensorNoise a pixel of brightness `y` (0 to 1) takes: all of it at black, a quarter at white
+inline float sensorNoiseWeight(float y)
+{
+  const float dark = 1.0F - saturate(y);
+  return 0.25F + 0.75F * dark * dark;
+}
+
+// A small sensor's noise at high gain, unlike film's grain: strongest in the shadows, and coloured:
+// a brightness noise on cells about a pixel across at 1080 lines, and a noise of each channel's own on
+// cells twice that (the colour blotches), both larger on a larger image so a picture's noise is the
+// same at every size. `amount` 1 is heavy: a near-black moves by up to about 0.17.
+inline float3 sensorNoise(float3 color, float amount, float2 pixel, float2 imageSize, uint32_t seed)
+{
+  const float  scale  = max(imageSize.y / 1080.0F, 1.0F);
+  const float2 fine   = (pixel + float2(0.5F)) / (1.1F * scale);
+  const float2 coarse = (pixel + float2(0.5F)) / (2.3F * scale);
+  const float  light  = sensorNoiseCell(fine, seed + 0x51ED270Bu) * 2.0F - 1.0F;
+  const float3 tint   = float3(sensorNoiseCell(coarse, seed + 0x2545F491u), sensorNoiseCell(coarse, seed + 0x9E3779B9u),
+                               sensorNoiseCell(coarse, seed + 0x7F4A7C15u))
+                      * 2.0F - float3(1.0F);
+  const float  weight = sensorNoiseWeight(luminance(saturate(color)));
+  return color + (float3(0.6F * light) + 0.5F * tint) * (0.15F * amount * weight);
+}
+
 // Returns a matrix that corrects a light source with the given Kelvin
 // temperature and Duv tint to RGB (1,1,1), then multiplies by exposure.
 // Use it like mul(inputMatrix, color).
@@ -586,16 +635,10 @@ inline float3 falseColorExposure(float luminance, float3 shown)
   }
 }
 
-inline float3 applyTonemap(TonemapperData tm, float3 color, float2 pixel, float2 imageSize)
+// The tone curve `tm` names, for a colour with exposure and white balance applied: sRGB-encoded
+inline float3 tonemapCurve(TonemapperData tm, float3 color)
 {
-  // Exposure and white balance.
-  // These are combined into a matrix and applied together before tonemapping
-  // because they're correcting for scene lighting and camera parameters.
-  color = mul(tm.inputMatrix, color);
-  const float exposed = luminance(color);  // the false-colour view's
-
   float3 c = color;
-  // Tonemap
   switch(tm.method)
   {
     case TONEMAP_METHOD(eFilmic):
@@ -619,6 +662,25 @@ inline float3 applyTonemap(TonemapperData tm, float3 color, float2 pixel, float2
     case TONEMAP_METHOD(eShaped):
       c = tonemapShaped(color, tm.shapedToe, tm.shapedShoulder);
       break;
+  }
+  return c;
+}
+
+inline float3 applyTonemap(TonemapperData tm, float3 color, float2 pixel, float2 imageSize)
+{
+  // Exposure and white balance.
+  // These are combined into a matrix and applied together before tonemapping
+  // because they're correcting for scene lighting and camera parameters.
+  color = mul(tm.inputMatrix, color);
+  const float exposed = luminance(color);  // the false-colour view's
+
+  // Tonemap
+  float3 c = tonemapCurve(tm, color);
+  // a small sensor's highlights in place of the curve's, middle grey where the curve has it
+  if(tm.sensorClip > 0.0F)
+  {
+    const float grey = toLinear(saturate(tonemapCurve(tm, float3(0.18F)))).y;
+    c                = lerp(c, sensorClipCurve(color, grey), float3(tm.sensorClip));
   }
 
   // SDR color grading.
@@ -678,6 +740,11 @@ inline float3 applyTonemap(TonemapperData tm, float3 color, float2 pixel, float2
   if(tm.grain > 0.0F)
   {
     c = filmGrain(c, tm.grain, pixel, imageSize, tm.grainSeed);
+  }
+  // a small sensor's noise
+  if(tm.sensorNoise > 0.0F)
+  {
+    c = sensorNoise(c, tm.sensorNoise, pixel, imageSize, tm.grainSeed);
   }
 
   // Dither assuming 8-bit output.
