@@ -183,11 +183,23 @@ inline float3 tonemapAgX(float3 color)
 > The Khronos PBR neutral tone mapper.
 
 Adapted from https://github.com/KhronosGroup/ToneMapping/blob/main/PBR_Neutral/pbrNeutral.glsl
+
+The desaturation is Khronos's 0.15 by default; `highlightDesaturation` makes it a handle.
 -------------------------------------------------------------------------------------------------*/
-inline float3 tonemapKhronosPBR(float3 color)
+
+// How fast a compressed colour goes white (Khronos PBR Neutral's `desaturation`, and Shaped's) for a
+// handle of 0 to 1: 0 none, keeping a bright colour's hue to the top; 0.5 Khronos's own 0.15; 1 eight
+// times that, a lamp or a neon tube burning out white a stop or two past the curve's knee. Cubic, so
+// the handle's lower half stays fine-grained around the colourful end.
+inline float highlightDesaturation(float handle)
+{
+  const float h = 2.0F * (handle < 0.0F ? 0.0F : (handle > 1.0F ? 1.0F : handle));
+  return 0.15F * h * h * h;  // exactly Khronos's at 0.5
+}
+
+inline float3 tonemapKhronosPBR(float3 color, float desaturation)
 {
   const float startCompression = 0.8F - 0.04F;
-  const float desaturation     = 0.15F;
 
 #ifdef __cplusplus
   float x    = glm::min(color.x, glm::min(color.y, color.z));
@@ -212,6 +224,11 @@ inline float3 tonemapKhronosPBR(float3 color)
   return toSrgb(color);
 }
 
+inline float3 tonemapKhronosPBR(float3 color)
+{
+  return tonemapKhronosPBR(color, 0.15F);
+}
+
 /*-------------------------------------------------------------------------------------------------
 # Function `tonemapShaped`
 > A filmic curve with two handles, worked in stops: `u` stops over mid grey in (0.18), `Y` stops over
@@ -234,7 +251,6 @@ static const float SHAPED_WHITE        = 16.0F;  // the value that comes out whi
 static const float SHAPED_TOE_START    = 1.5F;   // stops under mid grey where the toe bends
 static const float SHAPED_TOE_KNEE     = 0.5F;   // the bend's half-width, stops
 static const float SHAPED_TOE_MAX      = 1.5F;   // the steepening at a toe of 1, stops out a stop in
-static const float SHAPED_DESATURATION = 0.15F;  // Neutral's: how fast a compressed colour goes white
 
 inline float shapedMax(float a, float b)
 {
@@ -291,8 +307,9 @@ inline float shapedCurve(float x, float toe, float shoulder)
 }
 
 // The curve on a colour, linear display out: the brightest channel through it, the hue kept, then
-// eased to white by how much that channel was compressed
-inline float3 tonemapShapedLinear(float3 color, float toe, float shoulder)
+// eased to white by how much that channel was compressed, at `desaturation` (highlightDesaturation;
+// Neutral's 0.15 by default)
+inline float3 tonemapShapedLinear(float3 color, float toe, float shoulder, float desaturation = 0.15F)
 {
   color            = max(color, float3(0.0F));
   const float peak = shapedMax(color.x, shapedMax(color.y, color.z));
@@ -302,13 +319,13 @@ inline float3 tonemapShapedLinear(float3 color, float toe, float shoulder)
   if(peak > 3.0e38F)  // an infinite pixel: white
     return float3(1.0F);
   color *= newPeak / peak;
-  const float g = 1.0F - 1.0F / (SHAPED_DESATURATION * shapedMax(peak - newPeak, 0.0F) + 1.0F);
+  const float g = 1.0F - 1.0F / (desaturation * shapedMax(peak - newPeak, 0.0F) + 1.0F);
   return lerp(color, float3(newPeak), float3(g));
 }
 
-inline float3 tonemapShaped(float3 color, float toe, float shoulder)
+inline float3 tonemapShaped(float3 color, float toe, float shoulder, float desaturation = 0.15F)
 {
-  return toSrgb(tonemapShapedLinear(color, toe, shoulder));
+  return toSrgb(tonemapShapedLinear(color, toe, shoulder, desaturation));
 }
 
 // Computes the CIE 1960 chromaticity coordinates of a light source given
@@ -657,10 +674,10 @@ inline float3 tonemapCurve(TonemapperData tm, float3 color)
       c = tonemapAgX(color);
       break;
     case TONEMAP_METHOD(eKhronosPBR):
-      c = tonemapKhronosPBR(color);
+      c = tonemapKhronosPBR(color, highlightDesaturation(tm.highlightsToWhite));
       break;
     case TONEMAP_METHOD(eShaped):
-      c = tonemapShaped(color, tm.shapedToe, tm.shapedShoulder);
+      c = tonemapShaped(color, tm.shapedToe, tm.shapedShoulder, highlightDesaturation(tm.highlightsToWhite));
       break;
   }
   return c;

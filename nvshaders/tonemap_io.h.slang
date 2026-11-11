@@ -129,6 +129,10 @@ struct TonemapperData
   // moving with grainSeed
   float sensorClip  SLANG_DEFAULT(0.0F);
   float sensorNoise SLANG_DEFAULT(0.0F);
+  // Khronos PBR Neutral's and Shaped's highlights to white, 0 to 1 (highlightDesaturation): how fast a
+  // colour the curve compresses goes white. 0 keeps its colour to the top, 0.5 Khronos's own rate, 1
+  // burns a lamp or a neon tube out white as a sensor does. The other curves have their own and ignore it.
+  float highlightsToWhite SLANG_DEFAULT(0.5F);
 };
 
 
