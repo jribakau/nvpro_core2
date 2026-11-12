@@ -898,6 +898,38 @@ float shadowTerminatorTerm(float3 L, float3 N, float3 Ns)
 }
 
 /*
+How much light a bumped diffuse lobe takes from `L`, past Lambert's cosine at its bent normal `N`: the
+relief's own shadow, Smith's G1 for slopes of `slopeVariance` along each axis (Beckmann's, alpha^2 = 2
+variance), of the light's angle to the smooth normal `Ns`. A normal map's texels are facets of a
+microsurface, which a pixel's samples weigh by their area on the surface; over them Lambert's cosine
+times this takes in what the smooth surface's projected area does, as a real relief would, and each
+texel keeps its own cosine, so the relief still shows under a low light. The cosine alone takes in more
+toward grazing (slopes of 0.2: 4% more at 80 degrees, 37% at 85), lit faces the relief would shade; the
+shadow-terminator term (shadowTerminatorTerm), the light's angle to N with a roughness guessed from
+the tilt, still 37% at 85. Head-on both are under the smooth surface by the facets' tilt (3.6% at
+0.2), as a real relief's Lambert facets are, throwing light about their own normals. Walter et al.
+2007's rational fit to Beckmann's Lambda (within 0.4% of a Monte Carlo of the facets). A negative
+variance is not known: the terminator term.
+*/
+float bumpShadowing(float3 L, float3 N, float3 Ns, float slopeVariance)
+{
+  if(slopeVariance < 0.0f)
+    return shadowTerminatorTerm(L, N, Ns);
+  if(dot(N, L) <= 0.0f)
+    return 0.0f;
+  const float cosS = dot(Ns, L);
+  if(cosS <= 0.0f)
+    return 0.0f;  // under the smooth surface: in the relief's shadow
+  if(slopeVariance <= 0.0f || cosS >= 1.0f)
+    return 1.0f;
+  const float a = cosS / (sqrt(2.0f * slopeVariance) * sqrt(1.0f - cosS * cosS));
+  if(a >= 1.6f)
+    return 1.0f;
+  const float lambda = (1.0f - 1.259f * a + 0.396f * a * a) / (3.535f * a + 2.181f * a * a);
+  return 1.0f / (1.0f + lambda);
+}
+
+/*
 The specular lobes' normal ("don't flip", Quilez; Unreal's AdjustShadingNormal). A normal map can
 tilt `N` so far that a view `V` above the surface (`Ng`) mirrors below it, where a reflection lobe
 sends nothing: black pixels along bumped silhouettes. The normal is then bent back, depending on the
@@ -949,7 +981,7 @@ void brdf_diffuse_softened(PbrMaterial mat, float3 tint, float3 k2, NVSHADERS_OU
   const float  pN   = diffuseSofteningMixN(mat);
   const float3 s    = mat.diffuseSoftening;
   pdf               = (pN * cosN + (1.0f - pN) * cosS) * M_1_PI;
-  value = tint * M_1_PI * ((float3(1.0f) - s) * (cosN * shadowTerminatorTerm(k2, mat.N, mat.Ns)) + s * cosS);
+  value = tint * M_1_PI * ((float3(1.0f) - s) * (cosN * bumpShadowing(k2, mat.N, mat.Ns, mat.bumpSlopeVariance)) + s * cosS);
 }
 
 // Evaluates a diffuse lobe.
@@ -978,7 +1010,7 @@ void brdf_diffuse_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial 
   data.pdf = nk2 * M_1_PI;
 
   // For a white Lambert material, the bxdf components match the evaluation pdf. (See MDL_renderer.)
-  data.bsdf_diffuse = tint * data.pdf * shadowTerminatorTerm(data.k2, mat.N, mat.Ns);
+  data.bsdf_diffuse = tint * data.pdf * bumpShadowing(data.k2, mat.N, mat.Ns, mat.bumpSlopeVariance);
 }
 
 void brdf_diffuse_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat)
@@ -1022,7 +1054,7 @@ void brdf_diffuse_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial 
   data.k2  = normalize(data.k2);
   data.pdf = dot(data.k2, mat.N) * M_1_PI;
 
-  data.bsdf_over_pdf = tint * shadowTerminatorTerm(data.k2, mat.N, mat.Ns);  // bsdf * dot(wi, normal) / pdf;
+  data.bsdf_over_pdf = tint * bumpShadowing(data.k2, mat.N, mat.Ns, mat.bumpSlopeVariance);  // bsdf * dot(wi, normal) / pdf;
   data.event_type    = BSDF_EVENT_DIFFUSE_REFLECTION;
 }
 
