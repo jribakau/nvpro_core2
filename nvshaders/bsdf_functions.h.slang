@@ -595,6 +595,14 @@ float bsdfSheenScale(PbrMaterial mat, float VdotN)
   return 1.0F / max(bsdfSheenAlbedo(mat, VdotN), 1e-6F);
 }
 
+// The cosine-weighted mean over the hemisphere of a dielectric's Fresnel reflectance, seen from the
+// side of the lower index, at relative index `eta`: Kulla and Conty 2017's fit, 0.0895 at 1.5 (exactly
+// 0.0918), 0 at 1.
+float dielectricFresnelAverage(float eta)
+{
+  return eta <= 1.0F ? 0.0F : (eta - 1.0F) / (4.08567F + 1.00071F * eta);
+}
+
 /*-------------------------------------------------------------------------------------------------
 # Function `bsdfCoatDarkening`
 > What a coat takes from the base under it, past what it reflects at the view: light the coat reflects
@@ -602,13 +610,18 @@ float bsdfSheenScale(PbrMaterial mat, float VdotN)
 > OpenPBR 1.1's (1 - K) / (1 - E K), with E the base's albedo and K what the inside of a coat of index
 > 1.5 reflects: 0.09 over a smooth base, 0.6 over a rough one, by Fresnel's average over the hemisphere.
 > White keeps its energy, as does clear glass, whose light leaves through it. `coat` is the coverage,
-> `roughness` the base's GGX alpha.
+> `baseSpecular` what the base's own dielectric specular reflects on average (bsdfCoatBaseSpecular; 0
+> for a Lambert base, whose E is then its colour and K the diffuse 0.6: the smooth coat's exact closed
+> form), `roughness` the base's GGX alpha. It darkens all the base sends up, its own specular and a
+> metal's as well as its diffuse. Against the exact coat-over-base stack (the renderer's
+> BsdfLobes.ACoat*AgainstTheExactStack tests) a Lambert base had been up to 7.5% too bright and a plastic
+> 8-15% head-on, by a constant 9% specular in E for every base and none of the factor on the specular.
 -------------------------------------------------------------------------------------------------*/
-float3 bsdfCoatDarkening(float coat, float3 baseColor, float metallic, float transmission, float roughness)
+float3 bsdfCoatDarkening(float coat, float3 baseColor, float metallic, float baseSpecular, float transmission, float roughness)
 {
   const float kSmooth   = 0.0918F;                                           // F_avg(1.5)
   const float kRough    = 1.0F - (1.0F - kSmooth) / (1.5F * 1.5F);           // 0.5964
-  const float dielectricSpecularity = kSmooth;                               // the base's own, at about the same index
+  const float dielectricSpecularity = clamp(baseSpecular, 0.0F, 1.0F);
   const float specular  = dielectricSpecularity + (1.0F - dielectricSpecularity) * metallic;
   const float k         = kSmooth + (kRough - kSmooth) * (1.0F + (sqrt(roughness) - 1.0F) * specular);
   const float3 opaque   = baseColor + (float3(1.0F) - baseColor) * dielectricSpecularity;
@@ -626,24 +639,32 @@ float bsdfCoatClearTransmission(PbrMaterial mat)
   return max(mat.scatterCoefficient.x, max(mat.scatterCoefficient.y, mat.scatterCoefficient.z)) > VOLUME_MIN_SCATTER ? 0.0F : mat.transmission;
 }
 
+// What a base's own dielectric specular reflects on average (bsdfCoatDarkening's `baseSpecular`): its
+// weight times its Fresnel's mean at its index.
+float bsdfCoatBaseSpecular(float specular, float ior)
+{
+  return specular * dielectricFresnelAverage(ior);
+}
+
 // What a coat takes from the layers under it, seen from outside: one factor for all of them. From inside
 // the surface nothing is under the coat.
 float3 bsdfUnderCoat(PbrMaterial mat)
 {
   if(mat.clearcoat <= 0.0F || mat.ior1 > 1.0F)
     return float3(1.0F);
-  return bsdfCoatDarkening(mat.clearcoat, mat.baseColor, mat.metallic, bsdfCoatClearTransmission(mat), 0.5F * (mat.roughness.x + mat.roughness.y));
+  return bsdfCoatDarkening(mat.clearcoat, mat.baseColor, mat.metallic, bsdfCoatBaseSpecular(mat.specular, mat.ior2),
+                           bsdfCoatClearTransmission(mat), 0.5F * (mat.roughness.x + mat.roughness.y));
 }
 
 // How much of a surface's emission comes out through its coat at `VdotN`: emission lies under the coat,
 // so it loses what the coat reflects and what it gives back to the base. From the row's factors in a light
 // sample, which reads no textures but the emission's.
-float3 bsdfCoatEmission(float coat, float coatRoughness, float3 baseColor, float metallic, float transmission, float roughness, float VdotN)
+float3 bsdfCoatEmission(float coat, float coatRoughness, float3 baseColor, float metallic, float baseSpecular, float transmission, float roughness, float VdotN)
 {
   if(coat <= 0.0F)
     return float3(1.0F);
   const float reflected = clamp(coat * ggxDielectricAlbedo(1.5F, coatRoughness * coatRoughness, VdotN), 0.0F, 1.0F);
-  return (1.0F - reflected) * bsdfCoatDarkening(coat, baseColor, metallic, transmission, roughness);
+  return (1.0F - reflected) * bsdfCoatDarkening(coat, baseColor, metallic, baseSpecular, transmission, roughness);
 }
 
 /*-------------------------------------------------------------------------------------------------
@@ -818,7 +839,7 @@ ARRAY_TYPE(float, LOBE_COUNT, ) bsdfLobePick(PbrMaterial mat, ARRAY_TYPE(float, 
   ARRAY_TYPE(float, LOBE_COUNT, a);
   a[LOBE_DIFFUSE_REFLECTION]    = luminance(tint);
   a[LOBE_SPECULAR_TRANSMISSION] = 1.0F;
-  a[LOBE_SPECULAR_REFLECTION]   = 1.0F;
+  a[LOBE_SPECULAR_REFLECTION]   = s[LOBE_SPECULAR_REFLECTION] > 0.0F ? luminance(bsdfUnderCoat(mat)) : 0.0F;
   a[LOBE_METAL_REFLECTION]      = s[LOBE_METAL_REFLECTION] > 0.0F ? luminance(mat.baseColor * bsdfUnderCoat(mat)) : 0.0F;
   a[LOBE_SHEEN_REFLECTION]      = 1.0F;
   a[LOBE_CLEARCOAT_REFLECTION]  = 1.0F;
@@ -1864,9 +1885,9 @@ void bsdfEvaluateLobe(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial m
   {
     const BsdfLobeFresnel f = bsdfLobeFresnel(mat, lobe, dot(data.k1, mat.N), tint);
     brdf_ggx_smith_eval(data, mat, lobe, f.tint, f.fresnel, f.eta);
-    // A metal's tint is its Fresnel's f0, which a coat doesn't change; it darkens what the metal reflects
-    if(lobe == LOBE_METAL_REFLECTION)
-      data.bsdf_glossy *= bsdfUnderCoat(mat);
+    // A tint is a Fresnel's f0 (a metal's) or colour (a dielectric's), which a coat doesn't change; it
+    // darkens what either reflects, as it darkens the diffuse (bsdfCoatDarkening)
+    data.bsdf_glossy *= bsdfUnderCoat(mat);
   }
   else if(lobe == LOBE_SPECULAR_TRANSMISSION)
   {
@@ -2125,8 +2146,7 @@ void bsdfSampleLobe(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat, 
   {
     const BsdfLobeFresnel f = bsdfLobeFresnel(mat, lobe, dot(data.k1, mat.N), tint);
     brdf_ggx_smith_sample(data, mat, lobe, f.tint, f.fresnel, f.eta);
-    if(lobe == LOBE_METAL_REFLECTION)
-      data.bsdf_over_pdf *= bsdfUnderCoat(mat);
+    data.bsdf_over_pdf *= bsdfUnderCoat(mat);
   }
   else if(lobe == LOBE_SPECULAR_TRANSMISSION)
   {
