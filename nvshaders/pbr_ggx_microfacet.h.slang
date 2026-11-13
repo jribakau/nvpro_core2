@@ -47,8 +47,11 @@ float3 schlickFresnel(float3 F0, float3 F90, float VdotH)
 // Schlick Fresnel approximation for float
 float schlickFresnel(float ior, float VdotH)
 {
-  // Calculate reflectance at normal incidence (R0)
-  float R0 = pow((1.0F - ior) / (1.0F + ior), 2.0F);
+  // Calculate reflectance at normal incidence (R0). Squared by a product: the ratio is negative for
+  // any ior above 1, and pow of a negative base is undefined on the GPU. A driver folds pow(x, 2) to
+  // x * x in one build of a pipeline and not in the next, and then every pixel that came here was a NaN.
+  const float r  = (1.0F - ior) / (1.0F + ior);
+  const float R0 = r * r;
 
   // Fresnel reflectance using Schlick's approximation
   return R0 + (1.0F - R0) * pow(1.0F - VdotH, 5.0F);
