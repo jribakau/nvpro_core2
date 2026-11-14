@@ -57,6 +57,7 @@ public:
     glm::mat4                  perspectiveInv{1};  // inverse perspective matrix
     int                        isOrthographic{0};  // 1 if orthographic projection
     glm::vec2                  pickPos{0};         // normalized position
+    uint32_t                   instanceMask{0xFF};  // the TLAS instances the pick can land on (their mask's bits)
     VkAccelerationStructureKHR tlas{};             // top level acceleration structure
   };
 
