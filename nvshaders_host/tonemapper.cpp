@@ -166,6 +166,60 @@ void nvshaders::Tonemapper::runCompute(VkCommandBuffer                 cmd,
   vkCmdDispatch(cmd, groupSize.width, groupSize.height, 1);
 }
 
+void nvshaders::Tonemapper::cmdHistogram(VkCommandBuffer                 cmd,
+                                         const VkExtent2D&               size,
+                                         const shaderio::TonemapperData& tonemapper,
+                                         const VkDescriptorImageInfo&    inImage,
+                                         const VkDescriptorImageInfo&    outImage,
+                                         VkBuffer                        dst,
+                                         VkDeviceSize                    offset)
+{
+  NVVK_DBG_SCOPE(cmd);  // <-- Helps to debug in NSight
+  const VkDeviceSize bytes = sizeof(uint32_t) * EXPOSURE_HISTOGRAM_SIZE;
+
+  // The counts start at nothing, once whatever read them before (a copy, the AutoExposure pass) is done
+  nvvk::cmdBufferMemoryBarrier(cmd, {.buffer        = m_histogramBuffer.buffer,
+                                     .srcStageMask  = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                     .dstStageMask  = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                                     .srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+                                     .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT});
+  vkCmdFillBuffer(cmd, m_histogramBuffer.buffer, 0, bytes, 0);
+  nvvk::cmdBufferMemoryBarrier(cmd, {.buffer        = m_histogramBuffer.buffer,
+                                     .srcStageMask  = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                                     .dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                     .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                     .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT});
+
+  shaderio::TonemapperData data = tonemapper;
+  data.inputMatrix              = shaderio::getColorCorrectionMatrix(data.exposure, tonemapper.temperature, tonemapper.tint);
+  vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shaderio::TonemapperData), &data);
+  nvvk::WriteSetContainer writeSetContainer;
+  writeSetContainer.append(m_descriptorPack.makeWrite(shaderio::TonemapBinding::eImageInput), inImage);
+  writeSetContainer.append(m_descriptorPack.makeWrite(shaderio::TonemapBinding::eImageOutput), outImage);
+  writeSetContainer.append(m_descriptorPack.makeWrite(shaderio::TonemapBinding::eHistogramInputOutput), m_histogramBuffer);
+  writeSetContainer.append(m_descriptorPack.makeWrite(shaderio::TonemapBinding::eLuminanceInputOutput), m_exposureBuffer);
+  vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, writeSetContainer.size(),
+                            writeSetContainer.data());
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_histogramPipeline);
+  const VkExtent2D groupSize = nvvk::getGroupCounts(size, TONEMAP_WORKGROUP_SIZE);
+  vkCmdDispatch(cmd, groupSize.width, groupSize.height, 1);
+
+  nvvk::cmdBufferMemoryBarrier(cmd, {.buffer        = m_histogramBuffer.buffer,
+                                     .srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                     .dstStageMask  = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                                     .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                                     .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT});
+  const VkBufferCopy region{.srcOffset = 0, .dstOffset = offset, .size = bytes};
+  vkCmdCopyBuffer(cmd, m_histogramBuffer.buffer, dst, 1, &region);
+  nvvk::cmdBufferMemoryBarrier(cmd, {.buffer        = dst,
+                                     .srcStageMask  = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                                     .dstStageMask  = VK_PIPELINE_STAGE_2_HOST_BIT,
+                                     .offset        = offset,
+                                     .size          = bytes,
+                                     .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                     .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT});
+}
+
 void nvshaders::Tonemapper::runAutoExposureHistogram(VkCommandBuffer cmd, const VkExtent2D& size, const VkDescriptorImageInfo& inImage)
 {
   NVVK_DBG_SCOPE(cmd);  // <-- Helps to debug in NSight

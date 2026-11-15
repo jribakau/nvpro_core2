@@ -45,6 +45,18 @@ public:
                   const VkDescriptorImageInfo&    inImage,
                   const VkDescriptorImageInfo&    outImage);
 
+  // The Histogram pass alone, its counts (EXPOSURE_HISTOGRAM_SIZE uint32_t, bin 0 the black pixels)
+  // copied into `dst` at `offset` for the host to read once the frame is done: a meter for a caller
+  // that sets the exposure itself. `tonemapper`'s evMinValue, evMaxValue and centre metering say how
+  // `inImage` is counted; `outImage` is only named, as the passes' descriptors are shared.
+  void cmdHistogram(VkCommandBuffer                 cmd,
+                    const VkExtent2D&               size,
+                    const shaderio::TonemapperData& tonemapper,
+                    const VkDescriptorImageInfo&    inImage,
+                    const VkDescriptorImageInfo&    outImage,
+                    VkBuffer                        dst,
+                    VkDeviceSize                    offset);
+
 private:
   // Add new methods for histogram-based auto-exposure
   void runAutoExposureHistogram(VkCommandBuffer cmd, const VkExtent2D& size, const VkDescriptorImageInfo& inImage);
