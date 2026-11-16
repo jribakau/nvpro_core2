@@ -116,15 +116,17 @@ uint inputToHistogramBucket(const float3 inputColor)
 {
   const float inputLuminance = bt709Luminance(inputColor);
 
-  // Classify near-black pixels (excluded from exposure calculation)
-  const float kEpsilon = 0.00001f;
-  if(inputLuminance < kEpsilon)
+  // Classify near-black pixels (excluded from exposure calculation): under kEpsilon, or under the
+  // range's bottom where that is lower still, so a range that reaches down into a night's light
+  // (a moonlit landscape is some 1e-7) counts it
+  const float kEpsilon     = 0.00001f;
+  const float ev100        = luminanceEv100(inputLuminance);
+  if(inputLuminance <= 0.0f || (inputLuminance < kEpsilon && ev100 < tm.evMinValue))
   {
     return 0;
   }
 
-  // Convert luminance to EV100 and normalize to [0,1] range
-  const float ev100        = luminanceEv100(inputLuminance);
+  // Normalize EV100 to the [0,1] range
   const float evRange      = tm.evMaxValue - tm.evMinValue;
   const float normalizedEV = saturate((ev100 - tm.evMinValue) / evRange);
 
