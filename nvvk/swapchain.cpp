@@ -287,7 +287,7 @@ VkResult nvvk::Swapchain::acquireNextImage(VkDevice device, uint64_t timeout)
   }
 }
 
-void nvvk::Swapchain::presentFrame(VkQueue queue)
+VkResult nvvk::Swapchain::presentFrame(VkQueue queue)
 {
   // Present must wait on the present semaphore that follows the image
   // (not the in-flight slot), because vkAcquireNextImageKHR can return images
@@ -311,14 +311,16 @@ void nvvk::Swapchain::presentFrame(VkQueue queue)
   {
     m_needRebuild = true;
   }
-  else
+  else if(result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
   {
-    assert((result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) && "Couldn't present swapchain image");
+    // Not asserted: a lost surface or device is the caller's to report, so it is returned
+    LOGW("Failed to present swapchain image: %d\n", result);
   }
 
   // Advance to the next CPU in-flight slot (NOT the next image -- images are
   // chosen by the presentation engine).
   m_frameResourceIndex = (m_frameResourceIndex + 1) % m_framesInFlight;
+  return result;
 }
 
 std::vector<VkSurfaceFormat2KHR> nvvk::Swapchain::getAvailableFormats(VkPhysicalDevice physicalDevice, VkSurfaceKHR surface)

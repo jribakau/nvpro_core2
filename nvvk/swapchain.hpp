@@ -137,9 +137,11 @@ public:
   /*--
    * Presents the rendered image to the screen.
    * The semaphore ensures that the image is presented only after rendering is complete.
-   * Advances to the next frame in the cycle.
+   * Advances to the next frame in the cycle, whatever the result.
+   * Returns vkQueuePresentKHR's result: VK_ERROR_OUT_OF_DATE_KHR also sets needRebuilding();
+   * any error but that one (a lost surface or device) is the caller's to handle.
   -*/
-  void presentFrame(VkQueue queue);
+  VkResult presentFrame(VkQueue queue);
 
   // Transition the acquired swapchain image for write access / presentation.
   // Tracks per-image layout so transitions happen only after vkAcquireNextImageKHR.
