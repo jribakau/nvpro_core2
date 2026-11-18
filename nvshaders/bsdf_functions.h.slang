@@ -2368,6 +2368,11 @@ float bsdfSimpleGlossyProbability(float NdotV, float metallic)
 > Evaluates the simple BSDF model using the given material and input and output directions.
 
 You must provide `data.k1` and `data.k2`, but do not need to provide `data.xi`.
+
+Its masking-shadowing is Smith's height-correlated form (`ggx_smith_shadow_mask_correlated`,
+Heitz 2014), as the full BSDF's is: a microfacet hidden from one direction is likelier hidden
+from the other, so a rough surface loses less of its reflection at grazing angles than the
+separable product says.
 -------------------------------------------------------------------------------------------------*/
 void bsdfEvaluateSimple(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat)
 {
@@ -2402,14 +2407,14 @@ void bsdfEvaluateSimple(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial
   float3 localK1 = float3(dot(mat.T, data.k1), dot(mat.B, data.k1), NdotV);
   float3 localK2 = float3(dot(mat.T, data.k2), dot(mat.B, data.k2), NdotL);
   float  G1 = 0.0f, G2 = 0.0f;
-  ggx_smith_shadow_mask(G1, G2, localK1, localK2, mat.roughness);
+  float  G12 = ggx_smith_shadow_mask_correlated(G1, G2, localK1, localK2, mat.roughness);
 
   float diffusePdf  = M_1_PI * NdotL;
   float specularPdf = G1 * d * 0.25f / (NdotV * NdotH);
   data.pdf          = lerp(diffusePdf, specularPdf, bsdfSimpleGlossyProbability(NdotV, mat.metallic));
 
   data.bsdf_diffuse = mat.baseColor * fDiffuse * diffusePdf;  // Lambertian
-  data.bsdf_glossy  = fGlossy * G2 * specularPdf;             // GGX-Smith
+  data.bsdf_glossy  = fGlossy * (G1 > 0.0f ? G12 / G1 : 0.0f) * specularPdf;  // GGX-Smith: F D G12 / (4 NdotV)
 }
 
 /*-------------------------------------------------------------------------------------------------
