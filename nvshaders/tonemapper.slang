@@ -336,9 +336,11 @@ void AutoExposure(uint2 threadId: SV_DispatchThreadID, uint linearIndex: SV_Grou
     // Get previous luminance
     const float previousLuminance = OutLuminance[0];
 
-    // Smooth luminance adjustment using time-based adaptation
+    // Smooth luminance adjustment using time-based adaptation; none to adapt from on the first
+    // frame (Tonemapper::clearAutoExposure leaves 0, which no adapted luminance is), so it is the target
     const float adaptedLuminance =
-        previousLuminance + (targetLuminance - previousLuminance) * (1.f - exp2(-tm.autoExposureSpeed));
+        previousLuminance > 0.f ? previousLuminance + (targetLuminance - previousLuminance) * (1.f - exp2(-tm.autoExposureSpeed)) :
+                                  targetLuminance;
 
     if(linearIndex == 0)  // Only the first thread writes the final result
     {

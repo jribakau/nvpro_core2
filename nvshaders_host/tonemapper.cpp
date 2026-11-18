@@ -36,7 +36,8 @@ VkResult nvshaders::Tonemapper::init(nvvk::ResourceAllocator* alloc, std::span<c
   m_alloc  = alloc;
   m_device = alloc->getDevice();
 
-  // Create buffers
+  // Create buffers (new ones, so cleared before the first auto exposure, after a deinit too)
+  m_autoExposureCleared = false;
   alloc->createBuffer(m_exposureBuffer, sizeof(float),
                       VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT | VK_BUFFER_USAGE_2_TRANSFER_SRC_BIT,
                       VMA_MEMORY_USAGE_AUTO);
@@ -149,11 +150,11 @@ void nvshaders::Tonemapper::runCompute(VkCommandBuffer                 cmd,
   // Run auto-exposure histogram/exposure if enabled
   if(tonemapper.isActive && tonemapper.autoExposure)
   {
-    static bool firstRun = true;
-    if(firstRun)
+    // Each Tonemapper's own buffers, once: a static here cleared only the process's first one
+    if(!m_autoExposureCleared)
     {
-      clearHistogram(cmd);
-      firstRun = false;
+      clearAutoExposure(cmd);
+      m_autoExposureCleared = true;
     }
 
     runAutoExposureHistogram(cmd, size, inImage);
@@ -246,15 +247,18 @@ void nvshaders::Tonemapper::runAutoExposure(VkCommandBuffer cmd)
                                      .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT});
 }
 
-void nvshaders::Tonemapper::clearHistogram(VkCommandBuffer cmd)
+void nvshaders::Tonemapper::clearAutoExposure(VkCommandBuffer cmd)
 {
-  std::array<uint32_t, EXPOSURE_HISTOGRAM_SIZE> histogramData{0};
-  vkCmdUpdateBuffer(cmd, m_histogramBuffer.buffer, 0, sizeof(uint32_t) * EXPOSURE_HISTOGRAM_SIZE, histogramData.data());
-
-  // Add barrier to ensure update buffer completes before compute shader writes to the buffer
-  nvvk::cmdBufferMemoryBarrier(cmd, {.buffer        = m_histogramBuffer.buffer,
-                                     .srcStageMask  = VK_PIPELINE_STAGE_2_CLEAR_BIT,
-                                     .dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                                     .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                                     .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT});
+  // The adapted luminance at 0 tells the AutoExposure pass there is none yet: it takes the first
+  // frame's at once rather than adapting to it from whatever the memory held
+  vkCmdFillBuffer(cmd, m_histogramBuffer.buffer, 0, VK_WHOLE_SIZE, 0);
+  vkCmdFillBuffer(cmd, m_exposureBuffer.buffer, 0, VK_WHOLE_SIZE, 0);
+  for(VkBuffer buffer : {m_histogramBuffer.buffer, m_exposureBuffer.buffer})
+  {
+    nvvk::cmdBufferMemoryBarrier(cmd, {.buffer        = buffer,
+                                       .srcStageMask  = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                                       .dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                       .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                       .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT});
+  }
 }

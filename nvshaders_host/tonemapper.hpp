@@ -61,7 +61,9 @@ private:
   // Add new methods for histogram-based auto-exposure
   void runAutoExposureHistogram(VkCommandBuffer cmd, const VkExtent2D& size, const VkDescriptorImageInfo& inImage);
   void runAutoExposure(VkCommandBuffer cmd);
-  void clearHistogram(VkCommandBuffer cmd);
+  // Zeroes the histogram and the adapted luminance, which start as whatever their memory held:
+  // done once per Tonemapper, before its first auto exposure
+  void clearAutoExposure(VkCommandBuffer cmd);
 
   nvvk::ResourceAllocator* m_alloc{};
 
@@ -77,6 +79,7 @@ private:
   // Auto-Exposure
   nvvk::Buffer m_exposureBuffer;
   nvvk::Buffer m_histogramBuffer;
+  bool         m_autoExposureCleared = false;  // clearAutoExposure has run for these buffers
 };
 
 
