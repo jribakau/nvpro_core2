@@ -156,6 +156,20 @@ void nvshaders::Tonemapper::runCompute(VkCommandBuffer                 cmd,
       clearAutoExposure(cmd);
       m_autoExposureCleared = true;
     }
+    else
+    {
+      // What the last call did with the buffers, done and seen before this one's passes: its
+      // AutoExposure pass zeroed the histogram this one adds to, and wrote the luminance this one
+      // reads and writes (cmdHistogram, too, counts into the one and copies it out)
+      for(VkBuffer buffer : {m_histogramBuffer.buffer, m_exposureBuffer.buffer})
+      {
+        nvvk::cmdBufferMemoryBarrier(cmd, {.buffer        = buffer,
+                                           .srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                                           .dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                           .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                           .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT});
+      }
+    }
 
     runAutoExposureHistogram(cmd, size, inImage);
     runAutoExposure(cmd);
@@ -257,7 +271,7 @@ void nvshaders::Tonemapper::clearAutoExposure(VkCommandBuffer cmd)
     nvvk::cmdBufferMemoryBarrier(cmd, {.buffer        = buffer,
                                        .srcStageMask  = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                                        .dstStageMask  = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
-                                       .srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                                       .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,  // reads need only the wait
                                        .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT});
   }
   vkCmdFillBuffer(cmd, m_histogramBuffer.buffer, 0, VK_WHOLE_SIZE, 0);
