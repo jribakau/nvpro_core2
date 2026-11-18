@@ -2363,7 +2363,10 @@ for a material with no extensions, its lobes evaluated together rather than one 
 - a metal's microfacets reflect by Schlick's Fresnel from its base colour, and Turquin's factor
   gives back the light GGX's single scattering loses;
 - a normal map's relief shades the diffuse lobe (`bumpShadowing`, with `mat.Ns` the smooth normal and
-  `mat.bumpSlopeVariance` the map's slopes; nothing changes with `defaultPbrMaterial`'s).
+  `mat.bumpSlopeVariance` the map's slopes; nothing changes with `defaultPbrMaterial`'s);
+- where a normal map tilts `N` so far that the view would mirror below the face, the glossy lobe's
+  normal is bent back (`bsdfSpecularFrame`, with `mat.Ng` the face turned to the view) and the diffuse
+  lobe keeps `N`, whichever side of it the view is on; the lobes' weights are the view's at `N`.
 Seen from the rarer side (`ior2 >= ior1`), as a surface that only reflects is.
 -------------------------------------------------------------------------------------------------*/
 
@@ -2391,52 +2394,59 @@ Its masking-shadowing is Smith's height-correlated form (`ggx_smith_shadow_mask_
 Heitz 2014), as the full BSDF's is: a microfacet hidden from one direction is likelier hidden
 from the other, so a rough surface loses less of its reflection at grazing angles than the
 separable product says. Its Fresnel, albedo scaling, multiple scattering and relief shadow are
-the full BSDF's too (see "Simple BSDF Model" above): for a material with no extensions it gives
-what bsdfEvaluateAll does, but for the occlusion map and the specular normal's bend
-(bsdfSpecularFrame), which the caller handles.
+the full BSDF's too, and so is its glossy lobe's normal, bent back where a normal map tilts `N` past
+the view (see "Simple BSDF Model" above): for a material with no extensions it gives what
+bsdfEvaluateAll does, but for the occlusion map.
 -------------------------------------------------------------------------------------------------*/
 void bsdfEvaluateSimple(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat)
 {
-  // Specular reflection
-  float3 H     = normalize(data.k1 + data.k2);
-  float  NdotV = clampedDot(mat.N, data.k1);
-  float  NdotL = clampedDot(mat.N, data.k2);
-  float  VdotH = clampedDot(data.k1, H);
-  float  NdotH = clampedDot(mat.N, H);
+  data.bsdf_diffuse = data.bsdf_glossy = float3(0.0f);
+  data.pdf                             = 0.0f;
 
-  if(NdotV == 0.0f || NdotL == 0.0f || VdotH == 0.0f || NdotH == 0.0f)
-  {
-    data.bsdf_diffuse = data.bsdf_glossy = float3(0.0f);
-    data.pdf                             = 0.0f;
-    return;
-  }
-
+  // The lobes' weights are the view's at N, as computeLobeWeights has them; the glossy lobe is about
+  // the specular normal (bsdfSpecularFrame), the diffuse lobe about N.
+  //
   // We combine the metallic and specular lobes into a single glossy lobe.
   // The metallic weight is     metallic  * schlickFresnel(f0 = baseColor, VdotH) * Turquin's factor
   // The specular weight is (1-metallic) * ior_fresnel(eta, VdotH)
   // The diffuse weight is  (1-metallic) * (1 - the specular lobe's albedo at the view) * baseColor,
   //                        times the normal map's relief shadow
-  const float  eta      = mat.ior2 / mat.ior1;
-  const float  alpha    = 0.5F * (mat.roughness.x + mat.roughness.y);
-  const float3 fMetal   = schlickFresnel(mat.baseColor, float3(1.0F), VdotH) * ggxMultiScatterFactor(mat.baseColor, alpha, NdotV);
-  const float3 fGlossy  = lerp(float3(ior_fresnel(eta, VdotH)), fMetal, mat.metallic);
-  const float  fDiffuse = (1.0F - mat.metallic) * (1.0F - bsdfSimpleSpecularAlbedo(mat, NdotV))
+  const float NdotV       = clampedDot(mat.N, data.k1);
+  const float NdotL       = clampedDot(mat.N, data.k2);
+  const float diffusePdf  = M_1_PI * NdotL;
+  const float fDiffuse    = (1.0F - mat.metallic) * (1.0F - bsdfSimpleSpecularAlbedo(mat, NdotV))
                          * bumpShadowing(data.k2, mat.N, mat.Ns, mat.bumpSlopeVariance);
+  const PbrMaterial spec  = bsdfSpecularFrame(mat, data.k1);
+  float3      H           = normalize(data.k1 + data.k2);
+  float       sNdotV      = clampedDot(spec.N, data.k1);
+  float       sNdotL      = clampedDot(spec.N, data.k2);
+  float       VdotH       = clampedDot(data.k1, H);
+  float       NdotH       = clampedDot(spec.N, H);
+  float       specularPdf = 0.0f;
+  float3      glossy      = float3(0.0f);
+  if(sNdotV > 0.0f && sNdotL > 0.0f && VdotH > 0.0f && NdotH > 0.0f)
+  {
+    const float  eta     = mat.ior2 / mat.ior1;
+    const float  alpha   = 0.5F * (mat.roughness.x + mat.roughness.y);
+    const float3 fMetal  = schlickFresnel(mat.baseColor, float3(1.0F), VdotH) * ggxMultiScatterFactor(mat.baseColor, alpha, sNdotV);
+    const float3 fGlossy = lerp(float3(ior_fresnel(eta, VdotH)), fMetal, mat.metallic);
 
-  // Specular GGX
-  float3 localH  = float3(dot(mat.T, H), dot(mat.B, H), NdotH);
-  float  d       = hvd_ggx_eval(1.0f / mat.roughness, localH);
-  float3 localK1 = float3(dot(mat.T, data.k1), dot(mat.B, data.k1), NdotV);
-  float3 localK2 = float3(dot(mat.T, data.k2), dot(mat.B, data.k2), NdotL);
-  float  G1 = 0.0f, G2 = 0.0f;
-  float  G12 = ggx_smith_shadow_mask_correlated(G1, G2, localK1, localK2, mat.roughness);
+    // Specular GGX
+    float3 localH  = float3(dot(spec.T, H), dot(spec.B, H), NdotH);
+    float  d       = hvd_ggx_eval(1.0f / mat.roughness, localH);
+    float3 localK1 = float3(dot(spec.T, data.k1), dot(spec.B, data.k1), sNdotV);
+    float3 localK2 = float3(dot(spec.T, data.k2), dot(spec.B, data.k2), sNdotL);
+    float  G1 = 0.0f, G2 = 0.0f;
+    float  G12  = ggx_smith_shadow_mask_correlated(G1, G2, localK1, localK2, mat.roughness);
+    specularPdf = G1 * d * 0.25f / (sNdotV * NdotH);
+    glossy      = fGlossy * (G1 > 0.0f ? G12 / G1 : 0.0f) * specularPdf;  // GGX-Smith: F D G12 / (4 NdotV)
+  }
+  if(diffusePdf == 0.0f && specularPdf == 0.0f)
+    return;
 
-  float diffusePdf  = M_1_PI * NdotL;
-  float specularPdf = G1 * d * 0.25f / (NdotV * NdotH);
   data.pdf          = lerp(diffusePdf, specularPdf, bsdfSimpleGlossyProbability(mat, NdotV));
-
   data.bsdf_diffuse = mat.baseColor * fDiffuse * diffusePdf;  // Lambertian
-  data.bsdf_glossy  = fGlossy * (G1 > 0.0f ? G12 / G1 : 0.0f) * specularPdf;  // GGX-Smith: F D G12 / (4 NdotV)
+  data.bsdf_glossy  = glossy;
 }
 
 /*-------------------------------------------------------------------------------------------------
@@ -2463,11 +2473,12 @@ void bsdfSampleSimple(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat
   {
     // Glossy GGX
     data.event_type = BSDF_EVENT_GLOSSY_REFLECTION;
-    // Transform to local space
-    float3 localK1    = float3(dot(mat.T, data.k1), dot(mat.B, data.k1), nk1);
+    // Transform to local space, about the specular normal (bsdfSpecularFrame)
+    const PbrMaterial spec = bsdfSpecularFrame(mat, data.k1);
+    float3 localK1    = float3(dot(spec.T, data.k1), dot(spec.B, data.k1), clampedDot(spec.N, data.k1));
     float3 halfVector = hvd_ggx_sample_vndf(localK1, mat.roughness, data.xi.xy);
     // Transform from local space
-    halfVector = mat.T * halfVector.x + mat.B * halfVector.y + mat.N * halfVector.z;
+    halfVector = spec.T * halfVector.x + spec.B * halfVector.y + spec.N * halfVector.z;
     data.k2    = reflect(-data.k1, halfVector);
   }
   else
