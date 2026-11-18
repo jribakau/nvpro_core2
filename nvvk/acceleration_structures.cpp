@@ -621,8 +621,6 @@ void AccelerationStructureHelper::deinitAccelerationStructures(void)
 VkResult AccelerationStructureHelper::blasSubmitBuildAndWait(const std::vector<AccelerationStructureGeometryInfo>& asGeoInfoSet,
                                                              VkBuildAccelerationStructureFlagsKHR buildFlags)
 {
-  VkDevice device = m_alloc->getDevice();
-
   assert(blasSet.empty() && "we must not invoke build if already built. use deinit before.");
 
   // Prepare the BLAS build data
@@ -638,6 +636,30 @@ VkResult AccelerationStructureHelper::blasSubmitBuildAndWait(const std::vector<A
 
     blasBuildData.emplace_back(buildData);
   }
+  return blasBuildFilledAndWait(buildFlags);
+}
+
+VkResult AccelerationStructureHelper::blasSubmitBuildAndWait(std::span<const std::vector<AccelerationStructureGeometryInfo>> geometriesPerBlas,
+                                                             VkBuildAccelerationStructureFlagsKHR buildFlags)
+{
+  assert(blasSet.empty() && "we must not invoke build if already built. use deinit before.");
+
+  blasBuildData.reserve(geometriesPerBlas.size());
+  for(const auto& geometries : geometriesPerBlas)
+  {
+    assert(!geometries.empty() && "a BLAS needs a geometry");
+    AccelerationStructureBuildData buildData{VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR};
+    for(const auto& geometry : geometries)
+      buildData.addGeometry(geometry);
+    buildData.finalizeGeometry(m_alloc->getDevice(), buildFlags);
+    blasBuildData.emplace_back(std::move(buildData));
+  }
+  return blasBuildFilledAndWait(buildFlags);
+}
+
+VkResult AccelerationStructureHelper::blasBuildFilledAndWait(VkBuildAccelerationStructureFlagsKHR buildFlags)
+{
+  VkDevice device = m_alloc->getDevice();
 
   // build the set of BLAS
   blasSet.resize(blasBuildData.size());

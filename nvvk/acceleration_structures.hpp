@@ -19,6 +19,7 @@
 
 #pragma once
 #include <cassert>
+#include <span>
 #include <string>
 #include <sstream>
 #include <queue>
@@ -312,6 +313,11 @@ public:
   VkResult blasSubmitBuildAndWait(const std::vector<nvvk::AccelerationStructureGeometryInfo>& asGeoInfoSet,
                                   VkBuildAccelerationStructureFlagsKHR                        buildFlags);
 
+  // Builds a set of BLAS, each from all the geometries of one entry of geometriesPerBlas (a hit's
+  // geometry index says which of them it met). Same buildFlags for each, and returns as above.
+  VkResult blasSubmitBuildAndWait(std::span<const std::vector<nvvk::AccelerationStructureGeometryInfo>> geometriesPerBlas,
+                                  VkBuildAccelerationStructureFlagsKHR buildFlags);
+
 public:
   // TLAS related
 
@@ -335,6 +341,9 @@ public:
   VkResult tlasSubmitUpdateAndWait(const std::vector<VkAccelerationStructureInstanceKHR>& tlasInstances);
 
 private:
+  // Builds and compacts blasBuildData's BLAS into blasSet, as blasSubmitBuildAndWait says.
+  VkResult blasBuildFilledAndWait(VkBuildAccelerationStructureFlagsKHR buildFlags);
+
   nvvk::QueueInfo                                    m_queueInfo;
   nvvk::ResourceAllocator*                           m_alloc{nullptr};
   nvvk::StagingUploader*                             m_uploader{};
