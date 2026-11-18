@@ -618,8 +618,8 @@ void AccelerationStructureHelper::deinitAccelerationStructures(void)
   tlasSize            = {};
 }
 
-void AccelerationStructureHelper::blasSubmitBuildAndWait(const std::vector<AccelerationStructureGeometryInfo>& asGeoInfoSet,
-                                                         VkBuildAccelerationStructureFlagsKHR buildFlags)
+VkResult AccelerationStructureHelper::blasSubmitBuildAndWait(const std::vector<AccelerationStructureGeometryInfo>& asGeoInfoSet,
+                                                             VkBuildAccelerationStructureFlagsKHR buildFlags)
 {
   VkDevice device = m_alloc->getDevice();
 
@@ -649,61 +649,63 @@ void AccelerationStructureHelper::blasSubmitBuildAndWait(const std::vector<Accel
   VkDeviceSize hintScratchBudget = m_blasScratchBudget;  // Limiting the size of the scratch buffer to 2MB
   VkDeviceSize scratchSize       = blasBuilder.getScratchSize(hintScratchBudget, blasBuildData);
 
-  NVVK_CHECK(m_alloc->createBuffer(blasScratchBuffer, scratchSize,
-                                   VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
-                                       | VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR,
-                                   VMA_MEMORY_USAGE_AUTO, {}, m_accelStructProps.minAccelerationStructureScratchOffsetAlignment));
+  VkResult result = m_alloc->createBuffer(blasScratchBuffer, scratchSize,
+                                          VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
+                                              | VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR,
+                                          VMA_MEMORY_USAGE_AUTO, {}, m_accelStructProps.minAccelerationStructureScratchOffsetAlignment);
 
-  // Start the build and compaction of the BLAS
+  // Start the build and compaction of the BLAS, a batch within the budget at a time, until all are
+  // built or a step fails. A failed step's command buffer is still submitted with what it recorded,
+  // so it is freed, and the BLAS built so far are left in blasSet for deinitAccelerationStructures.
   VkDeviceSize hintBuildBudget = m_blasAccelerationStructureBudget;  // Limiting the size of the scratch buffer to 2MB
   bool         finished        = false;
 
   std::span<AccelerationStructureBuildData> buildDataSpan = blasBuildData;
   std::span<AccelerationStructure>          blasSpan      = blasSet;
 
-  do
+  while(result == VK_SUCCESS && !finished)
   {
     {
       VkCommandBuffer cmd = createSingleTimeCommands(device, m_transientPool);
 
-      VkResult result = blasBuilder.cmdCreateBlas(cmd, buildDataSpan, blasSpan, blasScratchBuffer.address,
-                                                  blasScratchBuffer.bufferSize, hintBuildBudget);
-      if(result == VK_SUCCESS)
-      {
-        finished = true;
-      }
-      else if(result != VK_INCOMPLETE)
-      {
-        // Any result other than VK_SUCCESS or VK_INCOMPLETE is an error
-        assert(0 && "Error building BLAS");
-      }
-      NVVK_CHECK(endSingleTimeCommands(cmd, device, m_transientPool, m_queueInfo.queue));
+      const VkResult built = blasBuilder.cmdCreateBlas(cmd, buildDataSpan, blasSpan, blasScratchBuffer.address,
+                                                       blasScratchBuffer.bufferSize, hintBuildBudget);
+      finished             = built == VK_SUCCESS;
+      // Any result other than VK_SUCCESS or VK_INCOMPLETE is an error
+      result                  = built == VK_SUCCESS || built == VK_INCOMPLETE ? VK_SUCCESS : built;
+      const VkResult submitted = endSingleTimeCommands(cmd, device, m_transientPool, m_queueInfo.queue);
+      result                  = result != VK_SUCCESS ? result : submitted;
     }
     // compact BLAS if needed
-    if(buildFlags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR)
+    if(result == VK_SUCCESS && (buildFlags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR))
     {
-      // Compacting the BLAS, and destroy the previous ones
-      VkCommandBuffer cmd = createSingleTimeCommands(device, m_transientPool);
-      blasBuilder.cmdCompactBlas(cmd, buildDataSpan, blasSpan);
-      NVVK_CHECK(endSingleTimeCommands(cmd, device, m_transientPool, m_queueInfo.queue));
-      blasBuilder.destroyNonCompactedBlas();
+      // Compacting the BLAS, and destroy the previous ones (VK_INCOMPLETE: batches remain, for the next round)
+      VkCommandBuffer cmd       = createSingleTimeCommands(device, m_transientPool);
+      const VkResult  compacted = blasBuilder.cmdCompactBlas(cmd, buildDataSpan, blasSpan);
+      const VkResult  submitted = endSingleTimeCommands(cmd, device, m_transientPool, m_queueInfo.queue);
+      result = compacted == VK_SUCCESS || compacted == VK_INCOMPLETE ? submitted : compacted;
+      if(result == VK_SUCCESS)
+        blasBuilder.destroyNonCompactedBlas();
     }
-  } while(!finished);
+  }
 
   blasBuildStatistics = blasBuilder.getStatistics();
 
-  // Giving a name to the BLAS
+  // Giving a name to the BLAS (those built: a failure leaves the rest without one, which the debug
+  // utils mustn't be given)
   for(size_t i = 0; i < blasSet.size(); i++)
   {
-    NVVK_DBG_NAME(blasSet[i].accel);
+    if(blasSet[i].accel != VK_NULL_HANDLE)
+      NVVK_DBG_NAME(blasSet[i].accel);
   }
 
-  // Cleanup
+  // Cleanup: the builder's query pool, and any original a compaction failed to replace
   blasBuilder.deinit();
+  return result;
 }
 
-void AccelerationStructureHelper::tlasSubmitBuildAndWait(const std::vector<VkAccelerationStructureInstanceKHR>& tlasInstances,
-                                                         VkBuildAccelerationStructureFlagsKHR buildFlags)
+VkResult AccelerationStructureHelper::tlasSubmitBuildAndWait(const std::vector<VkAccelerationStructureInstanceKHR>& tlasInstances,
+                                                             VkBuildAccelerationStructureFlagsKHR buildFlags)
 {
   VkDevice device = m_alloc->getDevice();
 
@@ -711,27 +713,20 @@ void AccelerationStructureHelper::tlasSubmitBuildAndWait(const std::vector<VkAcc
   assert((tlasInstancesBuffer.buffer == VK_NULL_HANDLE)
          && "Do not invoke build if already built. build with VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR, then use tlasUpdate");
 
-  VkCommandBuffer cmd = createSingleTimeCommands(device, m_transientPool);
+  // Everything that can fail comes before anything is recorded: a failure returns with what was made
+  // left for deinitAccelerationStructures, the instances' upload taken back.
 
   // Create the buffer of instances.
   // Instance buffer device addresses must be aligned to 16 bytes according to
   // https://vulkan.lunarg.com/doc/view/1.4.328.1/windows/antora/spec/latest/chapters/accelstructures.html#VUID-vkCmdBuildAccelerationStructuresKHR-pInfos-03717 .
   constexpr VmaAllocationCreateFlags instanceAllocFlags   = 0;
   constexpr VkDeviceSize             instanceMinAlignment = 16;
-  NVVK_CHECK(m_alloc->createBuffer(
+  NVVK_FAIL_RETURN(m_alloc->createBuffer(
       tlasInstancesBuffer, std::span<VkAccelerationStructureInstanceKHR const>(tlasInstances).size_bytes(),
       VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT,
-      VMA_MEMORY_USAGE_AUTO, instanceAllocFlags, instanceAllocFlags));
-  NVVK_CHECK(m_uploader->appendBuffer(tlasInstancesBuffer, 0, std::span<VkAccelerationStructureInstanceKHR const>(tlasInstances)));
+      VMA_MEMORY_USAGE_AUTO, instanceAllocFlags, instanceMinAlignment));
   NVVK_DBG_NAME(tlasInstancesBuffer.buffer);
-  m_uploader->cmdUploadAppended(cmd);
-  // Barrier to ensure transfer write completes before acceleration structure build.
-  // VK_ACCESS_2_SHADER_READ_BIT is required because the acceleration structure build
-  // operation reads the instance data from the buffer (not just writes to the AS).
-  // Without this flag, validation layers report READ_AFTER_WRITE hazards.
-  accelerationStructureBarrier(cmd, VK_ACCESS_TRANSFER_WRITE_BIT,
-                               VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_2_SHADER_READ_BIT);
-
+  NVVK_FAIL_RETURN(m_uploader->appendBuffer(tlasInstancesBuffer, 0, std::span<VkAccelerationStructureInstanceKHR const>(tlasInstances)));
 
   tlasBuildData = {VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR};
   AccelerationStructureGeometryInfo geometryInfo =
@@ -741,48 +736,70 @@ void AccelerationStructureHelper::tlasSubmitBuildAndWait(const std::vector<VkAcc
   // Get the size of the TLAS
   auto sizeInfo = tlasBuildData.finalizeGeometry(m_alloc->getDevice(), buildFlags);
 
-  // Create the scratch buffer
-  NVVK_CHECK(m_alloc->createBuffer(tlasScratchBuffer, sizeInfo.buildScratchSize,
-                                   VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT
-                                       | VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR,
-                                   VMA_MEMORY_USAGE_AUTO, {}, m_accelStructProps.minAccelerationStructureScratchOffsetAlignment));
-  NVVK_DBG_NAME(tlasScratchBuffer.buffer);
-
-  // Create the TLAS
-  NVVK_CHECK(m_alloc->createAcceleration(tlas, tlasBuildData.makeCreateInfo()));
+  // Create the scratch buffer, then the TLAS
+  VkResult result = m_alloc->createBuffer(tlasScratchBuffer, sizeInfo.buildScratchSize,
+                                          VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT
+                                              | VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR,
+                                          VMA_MEMORY_USAGE_AUTO, {}, m_accelStructProps.minAccelerationStructureScratchOffsetAlignment);
+  if(result == VK_SUCCESS)
+  {
+    NVVK_DBG_NAME(tlasScratchBuffer.buffer);
+    result = m_alloc->createAcceleration(tlas, tlasBuildData.makeCreateInfo());
+  }
+  if(result != VK_SUCCESS)
+  {
+    m_uploader->cancelAppended();
+    return result;
+  }
   NVVK_DBG_NAME(tlas.accel);
+
+  VkCommandBuffer cmd = createSingleTimeCommands(device, m_transientPool);
+  m_uploader->cmdUploadAppended(cmd);
+  // Barrier to ensure transfer write completes before acceleration structure build.
+  // VK_ACCESS_2_SHADER_READ_BIT is required because the acceleration structure build
+  // operation reads the instance data from the buffer (not just writes to the AS).
+  // Without this flag, validation layers report READ_AFTER_WRITE hazards.
+  accelerationStructureBarrier(cmd, VK_ACCESS_TRANSFER_WRITE_BIT,
+                               VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_2_SHADER_READ_BIT);
   tlasBuildData.cmdBuildAccelerationStructure(cmd, tlas.accel, tlasScratchBuffer.address);
 
   tlasSize = tlasInstances.size();
 
-  NVVK_CHECK(endSingleTimeCommands(cmd, device, m_transientPool, m_queueInfo.queue));
+  result = endSingleTimeCommands(cmd, device, m_transientPool, m_queueInfo.queue);
 
   m_uploader->releaseStaging();
+  return result;
 }
 
-void AccelerationStructureHelper::tlasSubmitUpdateAndWait(const std::vector<VkAccelerationStructureInstanceKHR>& tlasInstances)
+VkResult AccelerationStructureHelper::tlasSubmitUpdateAndWait(const std::vector<VkAccelerationStructureInstanceKHR>& tlasInstances)
 {
   VkDevice device = m_alloc->getDevice();
 
   bool sizeChanged = (tlasInstances.size() != tlasSize);
 
+  // What can fail first, as tlasSubmitBuildAndWait has it
+  NVVK_FAIL_RETURN(m_uploader->appendBuffer(tlasInstancesBuffer, 0, std::span(tlasInstances)));
+  if(tlasScratchBuffer.buffer == VK_NULL_HANDLE)
+  {
+    const VkResult made = m_alloc->createBuffer(tlasScratchBuffer, tlasBuildData.sizeInfo.buildScratchSize,
+                                                VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT,
+                                                VMA_MEMORY_USAGE_AUTO, {}, m_accelStructProps.minAccelerationStructureScratchOffsetAlignment);
+    if(made != VK_SUCCESS)
+    {
+      m_uploader->cancelAppended();
+      return made;
+    }
+    NVVK_DBG_NAME(tlasScratchBuffer.buffer);
+  }
+
   VkCommandBuffer cmd = createSingleTimeCommands(device, m_transientPool);
 
   // Update the instance buffer
-  m_uploader->appendBuffer(tlasInstancesBuffer, 0, std::span(tlasInstances));
   m_uploader->cmdUploadAppended(cmd);
 
   // Make sure the copy of the instance buffer are copied before triggering the acceleration structure build
   accelerationStructureBarrier(cmd, VK_ACCESS_TRANSFER_WRITE_BIT,
                                VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_2_SHADER_READ_BIT);
-
-  if(tlasScratchBuffer.buffer == VK_NULL_HANDLE)
-  {
-    NVVK_CHECK(m_alloc->createBuffer(tlasScratchBuffer, tlasBuildData.sizeInfo.buildScratchSize,
-                                     VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT,
-                                     VMA_MEMORY_USAGE_AUTO, {}, m_accelStructProps.minAccelerationStructureScratchOffsetAlignment));
-    NVVK_DBG_NAME(tlasScratchBuffer.buffer);
-  }
 
   // Building or updating the top-level acceleration structure
   if(sizeChanged)
@@ -796,9 +813,10 @@ void AccelerationStructureHelper::tlasSubmitUpdateAndWait(const std::vector<VkAc
   }
 
   // Make sure to have the TLAS ready before using it
-  NVVK_CHECK(endSingleTimeCommands(cmd, device, m_transientPool, m_queueInfo.queue));
+  const VkResult result = endSingleTimeCommands(cmd, device, m_transientPool, m_queueInfo.queue);
 
   m_uploader->releaseStaging();
+  return result;
 }
 
 }  // namespace nvvk

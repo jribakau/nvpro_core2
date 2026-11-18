@@ -307,8 +307,10 @@ public:
   // Builds a set of Bottom Level Acceleration Structures(BLAS) from a
   // Vector of geometry descriptors used for each BLAS
   // Same buildFlags will apply to each BLAS generated from asGeoInfoSet.
-  void blasSubmitBuildAndWait(const std::vector<nvvk::AccelerationStructureGeometryInfo>& asGeoInfoSet,
-                              VkBuildAccelerationStructureFlagsKHR                        buildFlags);
+  // Returns the first failure (out of memory, a lost device), after which the BLAS built so far stay
+  // in blasSet for deinitAccelerationStructures; VK_SUCCESS once every one is built.
+  VkResult blasSubmitBuildAndWait(const std::vector<nvvk::AccelerationStructureGeometryInfo>& asGeoInfoSet,
+                                  VkBuildAccelerationStructureFlagsKHR                        buildFlags);
 
 public:
   // TLAS related
@@ -321,13 +323,16 @@ public:
 
   // Builds the Top-Level Acceleration Structure (TLAS) from a list of instances
   // add VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR to buildFlags if you intend to use tlasUpdate
-  void tlasSubmitBuildAndWait(const std::vector<VkAccelerationStructureInstanceKHR>& tlasInstances,
-                              VkBuildAccelerationStructureFlagsKHR                   buildFlags);
+  // Returns a failure (out of memory, a lost device) as it comes, what was made left for
+  // deinitAccelerationStructures; VK_SUCCESS once the TLAS is built.
+  VkResult tlasSubmitBuildAndWait(const std::vector<VkAccelerationStructureInstanceKHR>& tlasInstances,
+                                  VkBuildAccelerationStructureFlagsKHR                   buildFlags);
 
   // Updates an existing TLAS with an updated list of instances.
   // If instance count differs from original, a rebuild is performed instead of an update.
   // TLAS must have been built with the VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR flag.
-  void tlasSubmitUpdateAndWait(const std::vector<VkAccelerationStructureInstanceKHR>& tlasInstances);
+  // Returns a failure as tlasSubmitBuildAndWait does.
+  VkResult tlasSubmitUpdateAndWait(const std::vector<VkAccelerationStructureInstanceKHR>& tlasInstances);
 
 private:
   nvvk::QueueInfo                                    m_queueInfo;
