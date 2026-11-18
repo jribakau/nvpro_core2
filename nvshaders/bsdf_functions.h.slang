@@ -2354,13 +2354,31 @@ void bsdfSampleMixture(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial ma
 # Simple BSDF Model
 The functions below are used to evaluate and sample the BSDF for a simple PBR material,
 without any additional lobes like clearcoat, sheen, etc. and without the need of random numbers.
-This is based on the metallic/roughness BRDF in Appendix B of the glTF specification.
+It is the metallic/roughness BRDF of Appendix B of the glTF specification as the full BSDF has it
+for a material with no extensions, its lobes evaluated together rather than one picked at random:
+- each microfacet of the dielectric's specular lobe reflects by the exact Fresnel of `ior2 / ior1`,
+  and the diffuse lobe takes what that lobe's albedo leaves at the view (Kulla and Conty's albedo
+  scaling), not `1 - F(VdotH)` towards each light, which leaves a diffuse surface lit from beyond
+  at a grazing view next to nothing;
+- a metal's microfacets reflect by Schlick's Fresnel from its base colour, and Turquin's factor
+  gives back the light GGX's single scattering loses;
+- a normal map's relief shades the diffuse lobe (`bumpShadowing`, with `mat.Ns` the smooth normal and
+  `mat.bumpSlopeVariance` the map's slopes; nothing changes with `defaultPbrMaterial`'s).
+Seen from the rarer side (`ior2 >= ior1`), as a surface that only reflects is.
 -------------------------------------------------------------------------------------------------*/
 
-// Returns the probability that bsdfSampleSimple samples a glossy lobe.
-float bsdfSimpleGlossyProbability(float NdotV, float metallic)
+// What the simple BSDF's dielectric specular lobe reflects of the light at view cosine `NdotV`:
+// its albedo with each microfacet weighed by the exact Fresnel (ggxDielectricAlbedo)
+float bsdfSimpleSpecularAlbedo(PbrMaterial mat, float NdotV)
 {
-  return lerp(schlickFresnel(0.04F, 1.0F, NdotV), 1.0F, metallic);
+  return ggxDielectricAlbedo(mat.ior2 / mat.ior1, 0.5F * (mat.roughness.x + mat.roughness.y), NdotV);
+}
+
+// Returns the probability that bsdfSampleSimple samples a glossy lobe: the share of the light the
+// dielectric's specular lobe reflects at the view (bsdfSimpleSpecularAlbedo), all of it for a metal.
+float bsdfSimpleGlossyProbability(PbrMaterial mat, float NdotV)
+{
+  return lerp(bsdfSimpleSpecularAlbedo(mat, NdotV), 1.0F, mat.metallic);
 }
 
 /*-------------------------------------------------------------------------------------------------
@@ -2372,7 +2390,10 @@ You must provide `data.k1` and `data.k2`, but do not need to provide `data.xi`.
 Its masking-shadowing is Smith's height-correlated form (`ggx_smith_shadow_mask_correlated`,
 Heitz 2014), as the full BSDF's is: a microfacet hidden from one direction is likelier hidden
 from the other, so a rough surface loses less of its reflection at grazing angles than the
-separable product says.
+separable product says. Its Fresnel, albedo scaling, multiple scattering and relief shadow are
+the full BSDF's too (see "Simple BSDF Model" above): for a material with no extensions it gives
+what bsdfEvaluateAll does, but for the occlusion map and the specular normal's bend
+(bsdfSpecularFrame), which the caller handles.
 -------------------------------------------------------------------------------------------------*/
 void bsdfEvaluateSimple(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat)
 {
@@ -2391,15 +2412,16 @@ void bsdfEvaluateSimple(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial
   }
 
   // We combine the metallic and specular lobes into a single glossy lobe.
-  // The metallic weight is     metallic *    fresnel(f0 = baseColor)
-  // The specular weight is (1-metallic) *    fresnel(f0 = c_min_reflectance)
-  // The diffuse weight is  (1-metallic) * (1-fresnel(f0 = c_min_reflectance)) * baseColor
-
-  // Fresnel terms
-  float  c_min_reflectance = 0.04F;
-  float3 f0                = lerp(float3(c_min_reflectance), mat.baseColor, mat.metallic);
-  float3 fGlossy           = schlickFresnel(f0, float3(1.0F), VdotH);  // Metallic + specular
-  float  fDiffuse          = schlickFresnel(1.0F - c_min_reflectance, 0.0F, VdotH) * (1.0F - mat.metallic);
+  // The metallic weight is     metallic  * schlickFresnel(f0 = baseColor, VdotH) * Turquin's factor
+  // The specular weight is (1-metallic) * ior_fresnel(eta, VdotH)
+  // The diffuse weight is  (1-metallic) * (1 - the specular lobe's albedo at the view) * baseColor,
+  //                        times the normal map's relief shadow
+  const float  eta      = mat.ior2 / mat.ior1;
+  const float  alpha    = 0.5F * (mat.roughness.x + mat.roughness.y);
+  const float3 fMetal   = schlickFresnel(mat.baseColor, float3(1.0F), VdotH) * ggxMultiScatterFactor(mat.baseColor, alpha, NdotV);
+  const float3 fGlossy  = lerp(float3(ior_fresnel(eta, VdotH)), fMetal, mat.metallic);
+  const float  fDiffuse = (1.0F - mat.metallic) * (1.0F - bsdfSimpleSpecularAlbedo(mat, NdotV))
+                         * bumpShadowing(data.k2, mat.N, mat.Ns, mat.bumpSlopeVariance);
 
   // Specular GGX
   float3 localH  = float3(dot(mat.T, H), dot(mat.B, H), NdotH);
@@ -2411,7 +2433,7 @@ void bsdfEvaluateSimple(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial
 
   float diffusePdf  = M_1_PI * NdotL;
   float specularPdf = G1 * d * 0.25f / (NdotV * NdotH);
-  data.pdf          = lerp(diffusePdf, specularPdf, bsdfSimpleGlossyProbability(NdotV, mat.metallic));
+  data.pdf          = lerp(diffusePdf, specularPdf, bsdfSimpleGlossyProbability(mat, NdotV));
 
   data.bsdf_diffuse = mat.baseColor * fDiffuse * diffusePdf;  // Lambertian
   data.bsdf_glossy  = fGlossy * (G1 > 0.0f ? G12 / G1 : 0.0f) * specularPdf;  // GGX-Smith: F D G12 / (4 NdotV)
@@ -2437,7 +2459,7 @@ void bsdfSampleSimple(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat
   data.bsdf_over_pdf = float3(0.0F);
 
   float nk1 = clampedDot(mat.N, data.k1);
-  if(data.xi.z <= bsdfSimpleGlossyProbability(nk1, mat.metallic))
+  if(data.xi.z <= bsdfSimpleGlossyProbability(mat, nk1))
   {
     // Glossy GGX
     data.event_type = BSDF_EVENT_GLOSSY_REFLECTION;
@@ -2485,13 +2507,12 @@ with Radiance Caching*.
 -------------------------------------------------------------------------------------------------*/
 float3 bsdfSimpleAverageReflectance(float3 k1, PbrMaterial mat)
 {
-  float  NdotV             = clampedDot(mat.N, k1);
-  float  c_min_reflectance = 0.04F;
-  float3 f0                = lerp(float3(c_min_reflectance), mat.baseColor, mat.metallic);
-  // This is approximate because
+  float NdotV    = clampedDot(mat.N, k1);
+  float specular = bsdfSimpleSpecularAlbedo(mat, NdotV);
+  // The metal's is approximate because
   // average_over_k2(fresnel(f0, 1.0f, VdotH)) != fresnel(f0, 1.0f, NdotV).
-  float3 bsdf_glossy_average = schlickFresnel(f0, float3(1.0F), NdotV);
-  float3 bsdf_diffuse_average = mat.baseColor * schlickFresnel(1.0F - c_min_reflectance, 0.0F, NdotV) * (1.0F - mat.metallic);
+  float3 bsdf_glossy_average  = lerp(float3(specular), schlickFresnel(mat.baseColor, float3(1.0F), NdotV), mat.metallic);
+  float3 bsdf_diffuse_average = mat.baseColor * (1.0F - specular) * (1.0F - mat.metallic);
   return bsdf_glossy_average + bsdf_diffuse_average;
 }
 
