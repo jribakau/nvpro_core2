@@ -250,7 +250,16 @@ void nvshaders::Tonemapper::runAutoExposure(VkCommandBuffer cmd)
 void nvshaders::Tonemapper::clearAutoExposure(VkCommandBuffer cmd)
 {
   // The adapted luminance at 0 tells the AutoExposure pass there is none yet: it takes the first
-  // frame's at once rather than adapting to it from whatever the memory held
+  // frame's at once rather than adapting to it from whatever the memory held. The fills wait for
+  // whatever used the buffers before (cmdHistogram counts into one, and copies it out)
+  for(VkBuffer buffer : {m_histogramBuffer.buffer, m_exposureBuffer.buffer})
+  {
+    nvvk::cmdBufferMemoryBarrier(cmd, {.buffer        = buffer,
+                                       .srcStageMask  = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                       .dstStageMask  = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                                       .srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                                       .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT});
+  }
   vkCmdFillBuffer(cmd, m_histogramBuffer.buffer, 0, VK_WHOLE_SIZE, 0);
   vkCmdFillBuffer(cmd, m_exposureBuffer.buffer, 0, VK_WHOLE_SIZE, 0);
   for(VkBuffer buffer : {m_histogramBuffer.buffer, m_exposureBuffer.buffer})
